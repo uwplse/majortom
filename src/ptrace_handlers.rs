@@ -2,9 +2,10 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use nix::unistd::{Pid, fork, ForkResult,execv};
 use nix::sys::ptrace;
-use nix::sys::wait::{waitpid, WaitStatus};
+use nix::sys::wait::{waitpid, WaitStatus, WaitPidFlag};
 use nix::sys::signal::{kill, Signal};
 use nix::sys::socket::{AddressFamily, SockProtocol, SockType, sockaddr_storage, sockaddr_in};
+use nix::sched::CloneFlags;
 use libc::user_regs_struct;
 use bincode::{serialize, deserialize};
 use std::mem::size_of;
@@ -22,7 +23,8 @@ enum File {
 
 #[derive(Debug, Clone)]
 struct TracedProcess {
-    pid: Pid,
+    tgid: Pid,
+    tid: Pid,
     files: HashMap<i32, File>
 }
 
@@ -116,7 +118,12 @@ enum Syscall {
     SigProcMask,
     SigAction,
     NanoSleep,
-    SendTo(i32, File, SocketAddress, Vec<u8>)
+    SendTo(i32, File, SocketAddress, Vec<u8>),
+    SetTidAddress,
+    SetRobustList,
+    Futex,
+    GetRLimit,
+    Clone(CloneFlags)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -136,7 +143,7 @@ impl TracedProcess {
         let proc = match fork()? {
             ForkResult::Parent {child, ..} => {
                 trace!("Started child with pid {}", child);
-                Self {pid: child, files: files}
+                Self {tgid: child, tid: child, files: files}
             },
             ForkResult::Child => {
                 ptrace::traceme().expect("couldn't call trace");
@@ -146,18 +153,54 @@ impl TracedProcess {
                 unreachable!();
             },
         };
-        proc.wait()?;
+        proc.wait_status()?;
+        let options = ptrace::Options::PTRACE_O_TRACECLONE
+            |ptrace::Options::PTRACE_O_TRACESYSGOOD
+            |ptrace::Options::PTRACE_O_TRACEFORK
+            |ptrace::Options::PTRACE_O_TRACEVFORK;
+        ptrace::setoptions(proc.tid, options)?;
         Ok(proc)
     }
     
     fn kill(&self) -> Result<(), Error> {
-        kill(self.pid, Signal::SIGKILL)?;
+        kill(self.tid, Signal::SIGKILL)?;
         Ok(())
     }
 
-    fn wait(&self) -> Result<(), Error> {
-        let status = waitpid(self.pid, None);
-        if let Ok(WaitStatus::Stopped(_, _)) = status {
+    fn wait_for_child_start(&self) -> Result<(), Error> {
+        trace!("waiting for child proc");
+        ptrace::attach(self.tid)?;
+        self.run_until_syscall()?;
+        let status = waitpid(Pid::from_raw(-1), None)?;
+        
+        trace!("Got child status {:?}", status);
+        panic!("outta here");
+    }
+
+    fn wait_status(&self) -> Result<WaitStatus, Error> {
+        let status = waitpid(Pid::from_raw(-1), None)?;
+        Ok(status)
+    }
+    
+    fn get_cloned_child(&self) -> Result<Self, Error> {
+        trace!("Clone executed, getting child info");
+        self.run_until_syscall()?;
+        let status = self.wait_status()?;
+        match status {
+            WaitStatus::PtraceEvent(_, _, _) => (),
+            _ => bail!("Bad status when trying to get clone info: {:?}", status)
+        }
+        let child = Pid::from_raw(ptrace::getevent(self.tid)? as i32);
+        let proc = Self {tgid: self.tgid, tid: child, files: (&self.files).clone()};
+        Ok(proc)
+    }
+
+    fn wait_on_syscall(&self) -> Result<(), Error> {
+        let status = self.wait_status()?;
+        if let WaitStatus::PtraceSyscall(p) = status {
+            if p != self.tgid {
+                bail!("Got wait result for wrong process: {:?}", status);
+            }
             Ok(())
         }
         else {
@@ -166,16 +209,16 @@ impl TracedProcess {
     }
 
     fn run_until_syscall(&self) -> Result<(), Error> {
-        ptrace::syscall(self.pid)?;
+        ptrace::syscall(self.tid)?;
         Ok(())
     }
 
     fn get_registers(&self) -> Result<user_regs_struct, Error> {
-        Ok(ptrace::getregs(self.pid)?)
+        Ok(ptrace::getregs(self.tid)?)
     }
 
     fn set_registers(&self, regs: user_regs_struct) -> Result<(), Error> {
-        Ok(ptrace::setregs(self.pid, regs)?)
+        Ok(ptrace::setregs(self.tid, regs)?)
     }
 
     // functions for reading
@@ -192,7 +235,7 @@ impl TracedProcess {
                 // interested in the underlying bytes, which means that we're
                 // interested in the c_long's representation *on this
                 // architecture*.
-                buf = ptrace::read(self.pid, (addr + (i as u64)) as ptrace::AddressType)?.to_ne_bytes();
+                buf = ptrace::read(self.tid, (addr + (i as u64)) as ptrace::AddressType)?.to_ne_bytes();
             }
             bytes.push(buf[i % size_of::<libc::c_long>()]);
             // addr incremented once for each *byte* read
@@ -205,7 +248,7 @@ impl TracedProcess {
         let mut bytes : Vec<u8> = Vec::new();
         let mut addr = addr;
         'outer: loop {
-            buf = ptrace::read(self.pid, addr as ptrace::AddressType)?;
+            buf = ptrace::read(self.tid, addr as ptrace::AddressType)?;
             let new_bytes = buf.to_ne_bytes();
             for b in new_bytes.iter() {
                 if *b == 0 {
@@ -225,7 +268,7 @@ impl TracedProcess {
         let total = size_of::<T>();
         for i in 0..total {
             if i % size_of::<libc::c_long>() == 0 {
-                buf = ptrace::read(self.pid, (addr + (i as u64)) as ptrace::AddressType)?.to_ne_bytes();
+                buf = ptrace::read(self.tid, (addr + (i as u64)) as ptrace::AddressType)?.to_ne_bytes();
             }
             bytes.push(buf[i % size_of::<libc::c_long>()]);
             // addr incremented once for each *byte* read
@@ -257,7 +300,7 @@ impl TracedProcess {
             if ((i + 1) % size_of::<libc::c_long>() == 0) ||
                 i + 1 == length {
                 let word = libc::c_long::from_ne_bytes(buf);
-                ptrace::write(self.pid, (addr + (i as u64)) as ptrace::AddressType,
+                ptrace::write(self.tid, (addr + (i as u64)) as ptrace::AddressType,
                               word as *mut libc::c_void)?;
             }
             // exit early if we're not iterating over whole vector
@@ -276,7 +319,7 @@ impl TracedProcess {
     }
     
     fn get_syscall(&self) -> Result<Syscall, Error> {
-        self.wait()?;
+        self.wait_on_syscall()?;
         let regs = self.get_registers()?;
         let call_number = regs.orig_rax;
         let call = match call_number {
@@ -378,8 +421,18 @@ impl TracedProcess {
                 let fd = regs.rdi as i32;
                 let socket_address = self.read_socket_address(regs.rsi, regs.rdx as usize)?;
                 Ok(Syscall::Bind(fd, socket_address))
+            },
+            56 => { // clone()
+                let flags = CloneFlags::from_bits(regs.rdi as i32)
+                    .ok_or(format_err!("Invalid clone() flags"))?;
+                Ok(Syscall::Clone(flags))
             }
+            97 => Ok(Syscall::GetRLimit),
             158 => Ok(Syscall::ArchPrctl),
+            // TODO: figure out if I need to actually worry about futexes
+            202 => Ok(Syscall::Futex),
+            218 => Ok(Syscall::SetTidAddress),
+            273 => Ok(Syscall::SetRobustList),
             _ => bail!("Unsupported system call {} called by process {:?}",
                         call_number, self)
         };
@@ -387,7 +440,7 @@ impl TracedProcess {
     }
 
     fn get_syscall_return(&mut self, call: Syscall) -> Result<SyscallReturn, Error> {
-        self.wait()?;
+        self.wait_on_syscall()?;
         let regs = self.get_registers()?;
         let sys_ret = regs.rax as i64;
         let ret = if sys_ret < 0 {
@@ -438,7 +491,7 @@ impl TracedProcess {
 
     fn wake_from_stopped_call(&self, call: Syscall) -> Result<(), Error> {
         self.run_until_syscall()?;
-        self.wait()?;
+        self.wait_on_syscall()?;
         // fake a good return value depending on the call
         let mut regs = self.get_registers()?;
         regs.rax = match call {
@@ -462,7 +515,7 @@ impl TracedProcess {
 
         // run syscall (which is a no-op)
         self.run_until_syscall()?;
-        self.wait()?;
+        self.wait_on_syscall()?;
 
         // write to process memory
         let written = self.write_data(buffer_ptr, buffer_len, data)?;
@@ -479,7 +532,17 @@ impl TracedProcess {
 
 impl Drop for TracedProcess {
     fn drop(&mut self) {
+        // only kill if we're the main process
+        if self.tid != self.tgid {
+            return;
+        }
         self.kill().expect("Failed to kill during drop");
+        let status = self.wait_status();
+        if let Ok(WaitStatus::Signaled(_, _, _)) = status {
+            return;
+        } else {
+            panic!("Unexpected wait status after killing process");
+        }
     }
 }
 
@@ -589,6 +652,11 @@ impl Handlers {
                         bail!("Send to unknown address {:?}", to_addr);
                     }
                 }
+                Syscall::Clone(_) => {
+                    let child = proc.get_cloned_child()?;
+                    trace!("New child process {:?}", child);
+                    child.wait_for_child_start()?;
+                }
                 _ => ()
             };
             proc.run_until_syscall()?;
@@ -604,9 +672,6 @@ impl Handlers {
         }
         let procid = TracedProcessIdentifier::main_process(node.clone());
         // kill proc if it's already started
-        if let Some(p) = &self.procs.get(&procid) {
-            p.kill()?;
-        }
         let program = &self.nodes[&node];
         let proc = TracedProcess::new(program.to_string())?;
         self.procs.insert(procid.clone(), proc);
