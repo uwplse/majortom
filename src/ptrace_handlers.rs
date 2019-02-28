@@ -203,7 +203,7 @@ impl TracedProcess {
     fn wait_on_syscall(&self) -> Result<(), Error> {
         let status = self.wait_status()?;
         if let WaitStatus::PtraceSyscall(p) = status {
-            if p != self.tgid {
+            if p != self.tid {
                 bail!("Got wait result for wrong process: {:?}", status);
             }
             Ok(())
@@ -546,7 +546,8 @@ impl Drop for TracedProcess {
         if let Ok(WaitStatus::Signaled(_, _, _)) = status {
             return;
         } else {
-            panic!("Unexpected wait status after killing process");
+            panic!("Unexpected wait status after killing process: {:?}",
+                   status);
         }
     }
 }
@@ -572,9 +573,12 @@ impl Handlers {
     /// event
     fn fill_response(&mut self, procid: TracedProcessIdentifier, response: &mut data::Response)
                      -> Result<(), Error> {
-        let proc = self.procs.get_mut(&procid).expect(
-            &format!("Bad process identifier {:?}", procid));
-        loop {
+        let mut stack = Vec::<TracedProcessIdentifier>::new();
+        stack.push(procid);
+        while let Some(procid) = stack.pop() {
+            trace!("Filling response from process {:?}", procid);
+            let proc = self.procs.get_mut(&procid).expect(
+                &format!("Bad process identifier {:?}", procid));
             proc.run_until_syscall()?;
             let call = proc.get_syscall()?;
             trace!("Process {:?} called Syscall {:?}", proc, call);
@@ -613,15 +617,11 @@ impl Handlers {
                 _ => ()
             }
             match &call {
-                Syscall::Bind(_, addr) => {
-                    self.address_to_name.insert(addr.clone(), procid.name.clone());
-                }
                 Syscall::RecvFrom(_, File::UDPSocket(Some(addr))) => {
                     proc.stop_syscall()?;
                     self.message_waiting_procs.insert(addr.clone(),
                                                       (procid.clone(), call.clone()));
                     // we're blocking, so we're done here
-                    return Ok(());
                 }
                 Syscall::NanoSleep => {
                     proc.stop_syscall()?;
@@ -636,7 +636,6 @@ impl Handlers {
                     };
                     response.timeouts.push(timeout);
                     // we're blocking, so we're done here
-                    return Ok(());
                 }
                 Syscall::SendTo(_, File::UDPSocket(from_addr), to_addr, data) => {
                     proc.stop_syscall()?;
@@ -652,27 +651,43 @@ impl Handlers {
                         response.messages.push(message);
                         // don't execute ordinary syscall return handling
                         proc.wake_from_stopped_call(call.clone())?;
-                        continue;
+                        // keep filling response
+                        stack.push(procid.clone());
                     } else {
                         bail!("Send to unknown address {:?}", to_addr);
                     }
                 }
                 Syscall::Clone(_) => { // TODO: handle different clone flags differently?
                     let (tid, child) = proc.get_cloned_child()?;
+                    // let parent finish syscall before starting to execute child
+                    proc.run_until_syscall()?;
+                    let ret = proc.get_syscall_return(call)?;
+                    trace!("Process {:?} got syscall return {:?}", proc, ret);
+                    stack.push(procid.clone());
+                    // Now execute child
                     trace!("New child process {:?}", child);
                     let child_id = procid.child_process(tid);
                     self.procs.insert(child_id.clone(), child);
                     // fill response from child process
-                    trace!("Calling fill_response on newly spawned child process {:?}",
-                           procid);
-                    self.fill_response(child_id, response);
+                    stack.push(child_id.clone());
                 }
-                _ => ()
-            };
-            proc.run_until_syscall()?;
-            let ret = proc.get_syscall_return(call)?;
-            trace!("Process {:?} got syscall return {:?}", proc, ret);
+                // TODO: find a way to avoid this duplication
+                Syscall::Bind(_, addr) => {
+                    self.address_to_name.insert(addr.clone(), procid.name.clone());
+                    proc.run_until_syscall()?;
+                    let ret = proc.get_syscall_return(call)?;
+                    trace!("Process {:?} got syscall return {:?}", proc, ret);
+                    stack.push(procid.clone());
+                }
+                _ => {
+                    proc.run_until_syscall()?;
+                    let ret = proc.get_syscall_return(call)?;
+                    trace!("Process {:?} got syscall return {:?}", proc, ret);
+                    stack.push(procid.clone());
+                }
+            }
         }
+        Ok(())
     }
     
     pub fn handle_start(&mut self, node: String, response: &mut data::Response)
