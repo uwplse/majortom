@@ -17,7 +17,7 @@ use crate::data;
 enum File {
     UDPSocket(Option<SocketAddress>),
     GlobalFile(String),
-//    LocalFile(String),
+//  LocalFile(String),
     Special
 }
 
@@ -25,18 +25,22 @@ enum File {
 struct TracedProcess {
     tgid: Pid,
     tid: Pid,
-    files: HashMap<i32, File>
+    files: HashMap<i32, File>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct TracedProcessIdentifier {
     name: String,
-    index: u32
+    tid: Option<Pid> // used only for child threads
 }
 
 impl TracedProcessIdentifier {
     fn main_process(name: String) -> Self {
-        Self {name, index: 0}
+        Self {name, tid: None}
+    }
+
+    fn child_process(&self, tid: Pid) -> Self {
+        Self {name: self.name.clone(), tid: Some(tid)}
     }
 }
 
@@ -169,20 +173,20 @@ impl TracedProcess {
 
     fn wait_for_child_start(&self) -> Result<(), Error> {
         trace!("waiting for child proc");
-        ptrace::attach(self.tid)?;
-        self.run_until_syscall()?;
-        let status = waitpid(Pid::from_raw(-1), None)?;
-        
-        trace!("Got child status {:?}", status);
-        panic!("outta here");
+        let status = self.wait_status()?;
+        match status {
+            WaitStatus::Stopped(pid, _) if pid == self.tid => (),
+            _ => bail!("Got bad status when waiting for child: {:?}", status)
+        };
+        Ok(())
     }
 
     fn wait_status(&self) -> Result<WaitStatus, Error> {
-        let status = waitpid(Pid::from_raw(-1), None)?;
+        let status = waitpid(Pid::from_raw(-1), Some(WaitPidFlag::__WALL))?;
         Ok(status)
     }
     
-    fn get_cloned_child(&self) -> Result<Self, Error> {
+    fn get_cloned_child(&self) -> Result<(Pid, Self), Error> {
         trace!("Clone executed, getting child info");
         self.run_until_syscall()?;
         let status = self.wait_status()?;
@@ -192,7 +196,8 @@ impl TracedProcess {
         }
         let child = Pid::from_raw(ptrace::getevent(self.tid)? as i32);
         let proc = Self {tgid: self.tgid, tid: child, files: (&self.files).clone()};
-        Ok(proc)
+        proc.wait_for_child_start()?;
+        Ok((child, proc))
     }
 
     fn wait_on_syscall(&self) -> Result<(), Error> {
@@ -652,10 +657,15 @@ impl Handlers {
                         bail!("Send to unknown address {:?}", to_addr);
                     }
                 }
-                Syscall::Clone(_) => {
-                    let child = proc.get_cloned_child()?;
+                Syscall::Clone(_) => { // TODO: handle different clone flags differently?
+                    let (tid, child) = proc.get_cloned_child()?;
                     trace!("New child process {:?}", child);
-                    child.wait_for_child_start()?;
+                    let child_id = procid.child_process(tid);
+                    self.procs.insert(child_id.clone(), child);
+                    // fill response from child process
+                    trace!("Calling fill_response on newly spawned child process {:?}",
+                           procid);
+                    self.fill_response(child_id, response);
                 }
                 _ => ()
             };
