@@ -12,11 +12,9 @@ int pings_sent;
 struct addrinfo themhints, *themres;
 
 void *background(void *arg) {
-  printf("thread running\n");
   int secs = *(int*)arg;
   while(1) {
     sleep(secs);
-    printf("thread sending ping\n");
     sendto(sockfd, "ping", 5, 0, themres->ai_addr, themres->ai_addrlen);
     pings_sent++;
   }
@@ -24,7 +22,6 @@ void *background(void *arg) {
 
 int main(int argc, char** argv) {
   if (argc != 3) {
-    printf("wrong argument number\n");
     return -1;
   }
   struct addrinfo mehints, *meres;
@@ -57,15 +54,11 @@ int main(int argc, char** argv) {
   socklen_t fromsize = sizeof(from);
 
   pings_sent = 0;
-  printf("sleeping\n");
   sleep(5);
   pthread_t tid;
   int secs = 5;
-  printf("creating thread hooray\n");
   pthread_create(&tid, NULL, background, &secs);
   while(1) {
-    printf("sending ping\n");
-    printf("really sending ping\n");
     sendto(sockfd, "ping", 5, 0, themres->ai_addr, themres->ai_addrlen);
     pings_sent++;
     recvfrom(sockfd, buf, 5, 0, &from, &fromsize);
