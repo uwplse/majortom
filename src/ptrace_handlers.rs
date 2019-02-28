@@ -153,11 +153,12 @@ impl TracedProcess {
                 ptrace::traceme().expect("couldn't call trace");
                 let args_cstring: Vec<CString> = args.into_iter().map(
                     |s| CString::new(s).unwrap()).collect();
-                execv(&CString::new(program_name).unwrap(), &args_cstring).expect("couldn't exec");
+                execv(&CString::new(program_name).unwrap(), &args_cstring)
+                    .expect("couldn't exec");
                 unreachable!();
             },
         };
-        proc.wait_status()?;
+        proc.wait_for_process_start()?;
         let options = ptrace::Options::PTRACE_O_TRACECLONE
             |ptrace::Options::PTRACE_O_TRACESYSGOOD
             |ptrace::Options::PTRACE_O_TRACEFORK
@@ -166,12 +167,23 @@ impl TracedProcess {
         Ok(proc)
     }
     
-    fn kill(&self) -> Result<(), Error> {
+    fn kill(&self, nthreads: usize) -> Result<(), Error> {
+        // should only kill group leaders
+        assert!(self.tid == self.tgid);
+        trace!("Killing process {:?}", self);
         kill(self.tid, Signal::SIGKILL)?;
+        for _i in 0..nthreads {
+            let status = self.wait_status()?;
+            match status {
+                WaitStatus::Signaled(_, _, _) => (),
+                _ => bail!("Unexpected wait status after killing process: {:?}",
+                           status)
+            }
+        }
         Ok(())
     }
 
-    fn wait_for_child_start(&self) -> Result<(), Error> {
+    fn wait_for_process_start(&self) -> Result<(), Error> {
         trace!("waiting for child proc");
         let status = self.wait_status()?;
         match status {
@@ -182,8 +194,16 @@ impl TracedProcess {
     }
 
     fn wait_status(&self) -> Result<WaitStatus, Error> {
-        let status = waitpid(Pid::from_raw(-1), Some(WaitPidFlag::__WALL))?;
-        Ok(status)
+        loop {
+            let status = waitpid(Pid::from_raw(-1), Some(WaitPidFlag::__WALL))?;
+            if let WaitStatus::Stopped(pid, nix::sys::signal::Signal::SIGWINCH) = status {
+                trace!("Got SIGWINCH, ignoring it and continuing");
+                // this is a hack!
+                ptrace::syscall(pid)?;
+            } else {
+                return Ok(status);
+            }
+        }
     }
     
     fn get_cloned_child(&self) -> Result<(Pid, Self), Error> {
@@ -196,7 +216,7 @@ impl TracedProcess {
         }
         let child = Pid::from_raw(ptrace::getevent(self.tid)? as i32);
         let proc = Self {tgid: self.tgid, tid: child, files: (&self.files).clone()};
-        proc.wait_for_child_start()?;
+        proc.wait_for_process_start()?;
         Ok((child, proc))
     }
 
@@ -535,23 +555,6 @@ impl TracedProcess {
     }
 }
 
-impl Drop for TracedProcess {
-    fn drop(&mut self) {
-        // only kill if we're the main process
-        if self.tid != self.tgid {
-            return;
-        }
-        self.kill().expect("Failed to kill during drop");
-        let status = self.wait_status();
-        if let Ok(WaitStatus::Signaled(_, _, _)) = status {
-            return;
-        } else {
-            panic!("Unexpected wait status after killing process: {:?}",
-                   status);
-        }
-    }
-}
-
 impl Handlers {
     pub fn new(nodes: HashMap<String, String>) -> Self {
         Self {nodes, procs: HashMap::new(), message_waiting_procs: HashMap::new(),
@@ -689,6 +692,38 @@ impl Handlers {
         }
         Ok(())
     }
+
+    fn kill_process(&mut self, procid: TracedProcessIdentifier) -> Result<(), Error> {
+        let mut child_proc_ids = Vec::<TracedProcessIdentifier>::new();
+        if let Some(proc) = self.procs.get(&procid) {
+            // figure out how many children this process has
+            for (other_proc_id, other_proc) in self.procs.iter() {
+                if other_proc.tgid == proc.tgid {
+                    child_proc_ids.push(other_proc_id.clone());
+                }
+            }
+            // kill the process
+            proc.kill(child_proc_ids.len())?;
+        }
+        self.procs.remove(&procid);
+        for child_id in child_proc_ids.iter() {
+            self.procs.remove(child_id);
+        }
+        Ok(())
+    }
+
+    fn kill_all_processes(&mut self) -> Result<(), Error> {
+        let mut proc_ids = Vec::<TracedProcessIdentifier>::new();
+        for (proc_id, proc) in self.procs.iter() {
+            if proc.tgid == proc.tid {
+                proc_ids.push(proc_id.clone());
+            }
+        }
+        for proc_id in proc_ids.iter() {
+            self.kill_process(proc_id.clone())?;
+        }
+        Ok(())
+    }
     
     pub fn handle_start(&mut self, node: String, response: &mut data::Response)
                         -> Result<(), Error> {
@@ -697,6 +732,8 @@ impl Handlers {
         }
         let procid = TracedProcessIdentifier::main_process(node.clone());
         // kill proc if it's already started
+        // need to make sure old process dies before new process starts
+        self.kill_process(procid.clone())?;
         let program = &self.nodes[&node];
         let proc = TracedProcess::new(program.to_string())?;
         self.procs.insert(procid.clone(), proc);
@@ -748,5 +785,12 @@ impl Handlers {
         } else {
             bail!("Timeout to unknown recipient")
         }
+    }
+}
+
+impl Drop for Handlers {
+    fn drop(&mut self) {
+        self.kill_all_processes()
+            .expect("Problem killing procs while dropping Handlers");
     }
 }
