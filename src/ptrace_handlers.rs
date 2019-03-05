@@ -42,6 +42,10 @@ impl TracedProcessIdentifier {
     fn child_process(&self, tid: Pid) -> Self {
         Self {name: self.name.clone(), tid: Some(tid)}
     }
+
+    fn parent_process(&self) -> Self {
+        Self {name: self.name.clone(), tid: None}
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -92,7 +96,11 @@ pub struct Handlers {
     message_waiting_procs: HashMap<SocketAddress, (TracedProcessIdentifier, Syscall)>,
     timeout_id_generator: TimeoutIdGenerator,
     timeout_waiting_procs: HashMap<TimeoutId, (TracedProcessIdentifier, Syscall)>,
-    address_to_name: HashMap<SocketAddress, String>
+    address_to_name: HashMap<SocketAddress, String>,
+    current_timeout: Option<data::Timeout>,
+    current_message: Option<data::Message>,
+    current_state: Option<serde_json::Value>,
+    annotate_state_procs: HashMap<TracedProcessIdentifier, TracedProcessIdentifier>
 }
 
 
@@ -127,7 +135,11 @@ enum Syscall {
     SetRobustList,
     Futex,
     GetRLimit,
-    Clone(CloneFlags)
+    Clone(CloneFlags),
+    SigAltStack,
+    SchedSetAffinity,
+    SchedGetAffinity,
+    Upcall(usize)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -453,11 +465,16 @@ impl TracedProcess {
                 Ok(Syscall::Clone(flags))
             }
             97 => Ok(Syscall::GetRLimit),
+            131 => Ok(Syscall::SigAltStack),
             158 => Ok(Syscall::ArchPrctl),
             // TODO: figure out if I need to actually worry about futexes
             202 => Ok(Syscall::Futex),
+            203 => Ok(Syscall::SchedSetAffinity),
+            204 => Ok(Syscall::SchedGetAffinity),
             218 => Ok(Syscall::SetTidAddress),
             273 => Ok(Syscall::SetRobustList),
+            // upcalls from application
+            x if x >= 5000 => Ok(Syscall::Upcall((x - 5000) as usize)),
             _ => bail!("Unsupported system call {} called by process {:?}",
                         call_number, self)
         };
@@ -522,6 +539,7 @@ impl TracedProcess {
         regs.rax = match call {
             Syscall::SendTo(_, _, _, data) =>
                 data.len() as u64,
+            Syscall::Upcall(_) => 42 as u64,
             _ => 0
         };
         self.set_registers(regs)?;
@@ -560,15 +578,63 @@ impl Handlers {
         Self {nodes, procs: HashMap::new(), message_waiting_procs: HashMap::new(),
               timeout_id_generator: TimeoutIdGenerator::new(),
               timeout_waiting_procs: HashMap::new(),
-              address_to_name: HashMap::new()}
+              annotate_state_procs: HashMap::new(),
+              address_to_name: HashMap::new(),
+              current_timeout: None,
+              current_message: None,
+              current_state: None}
     }
 
-    pub fn servers(self: &Self) -> Vec<&str> {
+    pub fn servers(&self) -> Vec<&str> {
         let mut res = Vec::new();
         res.extend(self.nodes.keys().map(|s| s.as_str()));
         res
     }
 
+    fn new_timeout(&mut self, ty: String) {
+        let mut timeout = data::Timeout::new();
+        timeout.ty = ty;
+        self.current_timeout = Some(timeout);
+    }
+
+    fn new_message(&mut self, ty: String) {
+        let mut message = data::Message::new();
+        message.ty = ty;
+        self.current_message = Some(message);
+    }
+    
+    fn current_body(&mut self) ->
+        Result<&mut serde_json::Value, Error> {
+        match self.current_timeout.as_mut() {
+            Some(timeout) => return Ok(&mut timeout.body),
+            None => ()
+        }
+        match self.current_message.as_mut() {
+            Some(message) => return Ok(&mut message.body),
+            None => ()
+        }
+        match self.current_state.as_mut() {
+            Some(state) => return Ok(state),
+            None => ()
+        }
+        bail!("No current body");
+    }
+
+    fn get_current_timeout(&mut self, node: String, timeout_id: TimeoutId) -> data::Timeout {
+        let mut timeout = self.current_timeout.take().unwrap_or_else(|| data::Timeout::new());
+        timeout.raw.extend(timeout_id.to_bytes());
+        timeout.to = node;
+        timeout
+    }
+
+    fn get_current_message(&mut self, from: String, to: String, data: Vec<u8>) -> data::Message {
+        let mut message = self.current_message.take().unwrap_or_else(|| data::Message::new());
+        message.from = from;
+        message.to = to;
+        message.raw.extend(data);
+        message
+    }
+    
     /// Fills the response from any non-blocking syscalls made by proc procid
     ///
     /// Should be called after any outstanding syscalls have been
@@ -631,29 +697,20 @@ impl Handlers {
                     let timeout_id = self.timeout_id_generator.next();
                     self.timeout_waiting_procs.insert(timeout_id.clone(),
                                                       (procid.clone(), call.clone()));
-                    let timeout = data::Timeout {
-                        to: procid.name.clone(),
-                        ty: "sleep()".to_string(),
-                        body: json!(format!("Timeout {}", timeout_id.id)),
-                        raw: timeout_id.to_bytes()
-                    };
+                    let timeout = self.get_current_timeout(procid.name.clone(), timeout_id);
                     response.timeouts.push(timeout);
                     // we're blocking, so we're done here
                 }
                 Syscall::SendTo(_, File::UDPSocket(from_addr), to_addr, data) => {
                     proc.stop_syscall()?;
                     if let Some(to) = self.address_to_name.get(&to_addr) {
+                        proc.wake_from_stopped_call(call.clone())?;
                         let raw = WireMessage {from: from_addr.clone(), to: to_addr.clone(), data: data.clone()};
-                        let message = data::Message {
-                            from: procid.name.clone(),
-                            to: to.clone(),
-                            ty: "Message".to_string(),
-                            body: json!("A message".to_string()),
-                            raw: serialize(&raw).unwrap()
-                        };
+                        let message = self.get_current_message(procid.name.clone(),
+                                                               to.clone(),
+                                                               serialize(&raw).unwrap());
                         response.messages.push(message);
                         // don't execute ordinary syscall return handling
-                        proc.wake_from_stopped_call(call.clone())?;
                         // keep filling response
                         stack.push(procid.clone());
                     } else {
@@ -682,6 +739,89 @@ impl Handlers {
                     trace!("Process {:?} got syscall return {:?}", proc, ret);
                     stack.push(procid.clone());
                 }
+                Syscall::Upcall(n) => {
+                    match n {
+                        0 => { // detect tracing
+                            proc.stop_syscall()?;
+                            proc.wake_from_stopped_call(call.clone())?;
+                            stack.push(procid.clone());
+                        }
+                        1 => { // annotate timeout
+                            let regs = proc.get_registers()?;
+                            let ty = proc.read_string(regs.rdi)?;
+                            trace!("Process {:?} setting timeout type to {}",
+                                   proc, ty);
+                            proc.stop_syscall()?;
+                            proc.wake_from_stopped_call(call.clone())?;
+                            self.new_timeout(ty);
+                            stack.push(procid.clone());
+                        }
+                        2 => { // annotate message
+                            let regs = proc.get_registers()?;
+                            let ty = proc.read_string(regs.rdi)?;
+                            trace!("Process {:?} setting message type to {}",
+                                   proc, ty);
+                            proc.stop_syscall()?;
+                            proc.wake_from_stopped_call(call.clone())?;
+                            self.new_message(ty);
+                            stack.push(procid.clone());
+                        }
+                        3 => { // annotate state
+                            proc.stop_syscall()?;
+                            self.annotate_state_procs.insert(procid.parent_process(), procid.clone());
+                            // we're going to block until we're needed
+                        }
+                        10 => { // int field
+                            let regs = proc.get_registers()?;
+                            let path = proc.read_string(regs.rdi)?;
+                            let value = regs.rsi;
+                            trace!("Process {:?} setting current.{} to {}",
+                                   proc, path, value);
+                            proc.stop_syscall()?;
+                            proc.wake_from_stopped_call(call.clone())?;
+                            let mut obj = self.current_body()?
+                                .as_object_mut().ok_or(format_err!("Bad json object"))?;
+                            let mut fields: Vec<&str> = path.rsplit(".").collect();
+                            while let Some(field) = fields.pop() {
+                                if fields.is_empty() {
+                                    obj.insert(field.to_string(), json!(value));
+                                }
+                                else {
+                                    if !obj.get(field).map_or(false, |x| x.is_object()) {
+                                        obj.insert(field.to_string(), json!({}));
+                                    }
+                                    obj = obj[field].as_object_mut().expect("Bad json object");
+                                }
+                            }
+                            stack.push(procid.clone());
+                        }
+                        11 => { // str field
+                            let regs = proc.get_registers()?;
+                            let path = proc.read_string(regs.rdi)?;
+                            let value = proc.read_string(regs.rsi)?;
+                            trace!("Process {:?} setting current.{} to {}",
+                                   proc, path, value);
+                            proc.stop_syscall()?;
+                            proc.wake_from_stopped_call(call.clone())?;
+                            let mut obj = self.current_body()?
+                                .as_object_mut().ok_or(format_err!("Bad json object"))?;
+                            let mut fields: Vec<&str> = path.rsplit(".").collect();
+                            while let Some(field) = fields.pop() {
+                                if fields.is_empty() {
+                                    obj.insert(field.to_string(), json!(value));
+                                }
+                                else {
+                                    if !obj.get(field).map_or(false, |x| x.is_object()) {
+                                        obj.insert(field.to_string(), json!({}));
+                                    }
+                                    obj = obj[field].as_object_mut().expect("Bad json object");
+                                }
+                            }
+                            stack.push(procid.clone());
+                        }
+                        _ => bail!("Bad upcall {}", n)
+                    }
+                }
                 _ => {
                     proc.run_until_syscall()?;
                     let ret = proc.get_syscall_return(call)?;
@@ -693,6 +833,18 @@ impl Handlers {
         Ok(())
     }
 
+    fn get_state(&mut self, procid: TracedProcessIdentifier, response: &mut data::Response) ->
+        Result<(), Error> {
+            if let Some(procid) = self.annotate_state_procs.remove(&procid) {
+                self.current_state = Some(json!({}));
+                let proc = self.procs.get_mut(&procid).expect("Bad procid");
+                proc.wake_from_stopped_call(Syscall::Upcall(10))?;
+                self.fill_response(procid.clone(), response)?;
+                response.states = json!({procid.name.clone(): self.current_state.take().unwrap()});
+            }
+            Ok(())
+    }
+    
     fn kill_process(&mut self, procid: TracedProcessIdentifier) -> Result<(), Error> {
         let mut child_proc_ids = Vec::<TracedProcessIdentifier>::new();
         if let Some(proc) = self.procs.get(&procid) {
@@ -737,7 +889,8 @@ impl Handlers {
         let program = &self.nodes[&node];
         let proc = TracedProcess::new(program.to_string())?;
         self.procs.insert(procid.clone(), proc);
-        self.fill_response(procid, response)?;
+        self.fill_response(procid.clone(), response)?;
+        self.get_state(procid.clone().parent_process(), response)?;
         Ok(())
     }
 
@@ -753,7 +906,9 @@ impl Handlers {
             // for now assume call is a recvfrom()
             let proc = self.procs.get_mut(procid).expect("Bad procid");
             proc.recvfrom_return(wire_message.from, wire_message.data)?;
+            let procid = procid.clone();
             self.fill_response(procid.clone(), response)?;
+            self.get_state(procid.parent_process(), response)?;
             Ok(())
         } else {
             bail!("Message to unknown recipient");
@@ -780,7 +935,9 @@ impl Handlers {
                 body: timeout.body,
                 raw: Vec::new()
             });
+            let procid = procid.clone();
             self.fill_response(procid.clone(), response)?;
+            self.get_state(procid.parent_process(), response)?;
             Ok(())
         } else {
             bail!("Timeout to unknown recipient")

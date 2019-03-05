@@ -1,4 +1,4 @@
-use serde_json as json;
+use serde_json as j;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Message {
@@ -6,19 +6,43 @@ pub struct Message {
     pub to: String,
     #[serde(rename="type")]
     pub ty: String,
-    pub body: json::Value,
+    pub body: j::Value,
     pub raw: Vec<u8>
 }
+
+
+impl Message {
+    pub fn new() -> Self {
+        Self {
+            from: "".to_string(),
+            to: "".to_string(),
+            ty: "timeout".to_string(),
+            body: json!({}),
+            raw: Vec::new()
+        }
+    }
+}
+
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Timeout {
     pub to: String,
     #[serde(rename="type")]
     pub ty: String,
-    pub body: json::Value,
+    pub body: j::Value,
     pub raw: Vec<u8>
 }
 
+impl Timeout {
+    pub fn new() -> Self {
+        Self {
+            to: "".to_string(),
+            ty: "timeout".to_string(),
+            body: json!({}),
+            raw: Vec::new()
+        }
+    }
+}
 
 #[derive(Deserialize, Debug)]
 #[serde(tag="msgtype")]
@@ -42,7 +66,8 @@ pub struct Response {
     #[serde(rename="set-timeouts")]
     pub timeouts: Vec<Timeout>,
     #[serde(rename="cleared-timeouts")]
-    pub cleared_timeouts: Vec<Timeout>
+    pub cleared_timeouts: Vec<Timeout>,
+    pub states: j::Value
 }
 
 impl Response {
@@ -50,7 +75,8 @@ impl Response {
         return Self {
             messages: Vec::new(),
             timeouts: Vec::new(),
-            cleared_timeouts: Vec::new()
+            cleared_timeouts: Vec::new(),
+            states: json!({})
         }
     }
 }
