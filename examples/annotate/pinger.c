@@ -15,7 +15,7 @@ struct addrinfo themhints, *themres;
 
 void state_function() {
   int_field("pings_sent", pings_sent);
-  str_field("hello doug", "hello");
+  str_field("test", "hello");
 }
 
 void *background(void *arg) {
