@@ -67,5 +67,7 @@ Vagrant.configure("2") do |config|
      apt-get update
      apt-get install -y git vim curl
      echo 'curl https://sh.rustup.rs -sSf | sh -s -- -y;' | su vagrant
+     apt-get install -y autoconf automake cmake curl gcc liboauth-dev libssl-dev libsasl2-dev libtool patch python ntp unzip libboost-all-dev pkg-config
+
   SHELL
 end
