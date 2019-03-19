@@ -1,0 +1,21 @@
+<!-- Copyright (c) 2013 Cloudera, Inc. All rights reserved. -->
+<assembly>
+    <id>assemble</id>
+    <formats>
+        <format>jar</format>
+    </formats>
+    <includeBaseDirectory>false</includeBaseDirectory>
+    <fileSets>
+      <fileSet>
+        <directory>${project.basedir}/src</directory>
+        <outputDirectory>/</outputDirectory>
+      </fileSet>
+      <fileSet>
+        <directory>${project.build.directory}/descriptor</directory>
+        <outputDirectory>/descriptor</outputDirectory>
+        <includes>
+          <include>service.mdl</include>
+        </includes>
+      </fileSet>
+     </fileSets>
+</assembly>

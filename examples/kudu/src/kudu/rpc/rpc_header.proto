@@ -1,0 +1,260 @@
+// Copyright (c) 2013, Cloudera, inc.
+// Confidential Cloudera Information: Covered by NDA.
+//
+// This RPC protocol is heavily based on HBase 0.96 and Hadoop 3.0.0.
+
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+option optimize_for = SPEED;
+
+package kudu.rpc;
+
+option java_package = "org.kududb.rpc";
+
+// See https://issues.apache.org/jira/browse/HBASE-7898 for high-level
+// description of RPC specification.
+//
+// Also see HADOOP-8990.
+//
+// On connection setup, the client sends seven bytes of preamble -- a four
+// byte magic, a byte of version, a byte of service class, and a byte of
+// authentication type.
+//
+// Next, if SASL is specified to be used, SASL negotiation takes place.
+//
+// We then send a ConnectionContextPB protobuf of user information and the
+// 'protocol' or 'service' that is to be run over this connection as well as
+// info such as codecs and compression to use when we send cell blocks(see below).
+// This connection header protobuf is prefaced by an int that holds the length
+// of this connection header (this is NOT a varint).  The pb connection header
+// is sent with Message#writeTo.  The server throws an exception if it doesn't
+// like what it was sent noting what it is objecting too.  Otherwise, the server
+// says nothing and is open for business.
+//
+// Hereafter the client makes requests and the server returns responses.
+//
+// Requests look like this:
+//
+// <An int with the total length of the request>
+// <RequestHeader Message written out using Message#writeDelimitedTo>
+// <Optionally a Request Parameter Message written out using Message#writeDelimitedTo>
+// <Optionally a Cell block>
+//
+// ...where the Request Parameter Message is whatever the method name stipulated
+// in the RequestHeader expects; e.g. if the method is a scan, then the pb
+// Request Message is a GetRequest, or a ScanRequest.  A block of Cells
+// optionally follows.  The presence of a Request param Message and/or a
+// block of Cells will be noted in the RequestHeader.
+//
+// Response is the mirror of the request:
+//
+// <An int with the total length of the response>
+// <ResponseHeader Message written out using Message#writeDelimitedTo>
+// <Optionally a Response Result Message written out using Message#writeDelimitedTo>
+// <Optionally a Cell block>
+//
+// ...where the Response Message is the response type that goes with the
+// method specified when making the request and the follow on Cell blocks may
+// or may not be there -- read the response header to find out if one following.
+// If an exception, it will be included inside the Response Header.
+//
+// Any time we write a pb, we do it with Message#writeDelimitedTo EXCEPT when
+// the connection header is sent; this is prefaced by an int with its length
+// and the pb connection header is then written with Message#writeTo.
+//
+
+// ----------------------------------
+
+// User Information proto.  Included in ConnectionHeader on connection setup.
+message UserInformationPB {
+  optional string effective_user = 1;
+  required string real_user = 2;
+}
+
+/**
+ * The connection context is sent as part of the connection establishment.
+ * It establishes the context for ALL RPC calls within the connection.
+ * This is sent on connection setup after the connection preamble is sent.
+ * Generally, no response is sent from the server to the client.
+ */
+message ConnectionContextPB {
+  // UserInfo beyond what is determined as part of security handshake
+  // at connection time (kerberos, tokens etc).
+  optional UserInformationPB user_info = 2;
+}
+
+// Message type passed back & forth for the SASL negotiation.
+message SaslMessagePB {
+  enum SaslState {
+    UNKNOWN   = 999;
+    SUCCESS   = 0;
+    NEGOTIATE = 1;
+    INITIATE  = 2;
+    CHALLENGE = 3;
+    RESPONSE  = 4;
+  }
+
+  message SaslAuth {
+    required string method    = 1;  // The application's idea of a method, i.e. SIMPLE, DIGEST, KERBEROS.
+    required string mechanism = 2;  // Standard SASL mechanism, i.e. ANONYMOUS, PLAIN, GSSAPI.
+    optional string protocol  = 3;  // From Hadoop. Usage TBD.
+    optional string serverId  = 4;  // From Hadoop. Usage TBD.
+
+    // SASL challenge token from server, if the client chooses to use this method.
+    // Only used when the server is piggy-backing a challenge on a NEGOTIATE response.
+    // Otherwise, SaslMessagePB::token is used as the challenge token.
+    optional bytes challenge = 5;
+  }
+
+  optional uint32 version  = 1;
+  required SaslState state = 2;  // RPC system SASL state.
+  optional bytes token     = 3;
+  repeated SaslAuth auths  = 4;
+}
+
+message RemoteMethodPB {
+  // Service name for the RPC layer.
+  // The client created a proxy with this service name.
+  // Example: kudu.rpc_test.CalculatorService
+  required string service_name = 1;
+
+  // Name of the RPC method.
+  required string method_name = 2;
+};
+
+// The header for the RPC request frame.
+message RequestHeader {
+  //optional RpcKindPB rpc_kind = 1;  // From Hadoop. Not applicable to Kudu.
+  //optional OperationPB rpc_op = 2;  // From Hadoop. Not applicable to Kudu.
+
+  // A sequence number that is sent back in the Response. Hadoop specifies a uint32 and
+  // casts it to a signed int. That is counterintuitive, so we use an int32 instead.
+  // Allowed values (inherited from Hadoop):
+  //   0 through INT32_MAX: Regular RPC call IDs.
+  //   -2: Invalid call ID.
+  //   -3: Connection context call ID.
+  //   -33: SASL negotiation call ID.
+  required int32 call_id = 3;
+
+  // Globally unique client ID (UUID). Note: clientId + callId uniquely identifies a request.
+  // TODO: Make clientId a required field?
+  //optional bytes client_id = 4;
+
+  // Retry count, 1 means this is the first retry. From Hadoop. Not supported in Kudu.
+  //optional sint32 retry_count = 5 [default = -1];
+
+  // RPC method being invoked.
+  // Not used for "connection setup" calls.
+  optional RemoteMethodPB remote_method = 6;
+
+  /**
+   * From Hadoop. Hadoop's explanation below:
+   * RPCs for a particular interface (ie service) are done using a
+   * IPC connection that is setup using ConnectionContextPB.
+   *
+   * Each RPC call also sends a protocol name
+   * (called declaringClassprotocolName). This name is usually the same
+   * as the connection protocol name except in some cases.
+   * For example metaProtocols such ProtocolInfoProto which get metainfo
+   * about the protocol reuse the connection but need to indicate that
+   * the actual protocol is different (i.e. the protocol is
+   * ProtocolInfoProto) since they reuse the connection; in this case
+   * the declaringClassProtocolName field is set to the ProtocolInfoProto
+   */
+  //optional string declaring_class_service_name = 7;
+
+  // Service version of the client stub class declaring the called method.
+  //optional uint64 client_service_version = 8;
+
+  // TODO: Trace info.
+  // optional RPCTInfo trace_info = 9;
+
+  // Propagate the timeout as specified by the user. Note that, since there is some
+  // transit time between the client and server, if you wait exactly this amount of
+  // time and then respond, you are likely to cause a timeout on the client.
+  optional uint32 timeout_millis = 10;
+}
+
+message ResponseHeader {
+  required int32 call_id = 1;
+
+  // If this is set, then this is an error response and the
+  // response message will be of type ErrorStatusPB instead of
+  // the expected response type.
+  optional bool is_error = 2 [ default = false ];
+
+  // Byte offsets for side cars in the main body of the response message.
+  // These offsets are counted AFTER the message header, i.e., offset 0
+  // is the first byte after the bytes for this protobuf.
+  repeated uint32 sidecar_offsets = 3;
+
+  //optional uint32 server_ipc_version_num = 3; // Sent if success or fail
+  //optional bytes client_id = 7; // Globally unique client ID
+  //optional sint32 retry_count = 8 [default = -1];
+}
+
+// Sent as response when is_error == true.
+message ErrorStatusPB {
+
+  // These codes have all been inherited from Hadoop's RPC mechanism.
+  enum RpcErrorCodePB {
+    FATAL_UNKNOWN = 10;
+
+    // Non-fatal RPC errors. Connection should be left open for future RPC calls.
+    //------------------------------------------------------------
+    // The application generated an error status. See the message field for
+    // more details.
+    ERROR_APPLICATION = 1;
+
+    // The specified method was not valid.
+    ERROR_NO_SUCH_METHOD = 2;
+
+    // The specified service was not valid.
+    ERROR_NO_SUCH_SERVICE = 3;
+
+    // The server is overloaded - the client should try again shortly.
+    ERROR_SERVER_TOO_BUSY = 4;
+
+    // The request parameter was not parseable or was missing required fields.
+    ERROR_INVALID_REQUEST = 5;
+
+    // FATAL_* errors indicate that the client should shut down the connection.
+    //------------------------------------------------------------
+    // The RPC server is already shutting down.
+    FATAL_SERVER_SHUTTING_DOWN = 11;
+    // Fields of RpcHeader are invalid.
+    FATAL_INVALID_RPC_HEADER = 12;
+    // Could not deserialize RPC request.
+    FATAL_DESERIALIZING_REQUEST = 13;
+    // IPC Layer version mismatch.
+    FATAL_VERSION_MISMATCH = 14;
+    // Auth failed.
+    FATAL_UNAUTHORIZED = 15;
+  }
+
+  required string message = 1;
+
+  // TODO: Make code required?
+  optional RpcErrorCodePB code = 2;  // Specific error identifier.
+
+  // Allow extensions. When the RPC returns ERROR_APPLICATION, the server
+  // should also fill in exactly one of these extension fields, which contains
+  // more details on the service-specific error.
+  extensions 100 to max;
+}

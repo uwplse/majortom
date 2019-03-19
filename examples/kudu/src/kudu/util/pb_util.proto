@@ -1,0 +1,26 @@
+// Copyright (c) 2014, Cloudera, inc.
+// Confidential Cloudera Information: Covered by NDA.
+package kudu;
+
+option java_package = "org.kududb";
+
+import "google/protobuf/descriptor.proto";
+
+// ============================================================================
+//  Protobuf container metadata
+// ============================================================================
+
+// Supplemental protobuf container header, after the main header (see
+// pb_util.h for details).
+message ContainerSupHeaderPB {
+  // The protobuf schema for the messages expected in this container.
+  //
+  // This schema is complete, that is, it includes all of its dependencies
+  // (i.e. other schemas defined in .proto files imported by this schema's
+  // .proto file).
+  required google.protobuf.FileDescriptorSet protos = 1;
+
+  // The PB message type expected in each data entry in this container. Must
+  // be fully qualified (i.e. kudu.tablet.TabletSuperBlockPB).
+  required string pb_type = 2;
+}

@@ -1,0 +1,14 @@
+[[resources]]
+= Resources
+
+:author: Kudu Team
+:imagesdir: ./images
+:icons: font
+:toc: left
+:toclevels: 3
+:doctype: book
+:backend: html5
+:sectlinks:
+:experimental:
+
+
