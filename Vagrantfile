@@ -49,13 +49,10 @@ Vagrant.configure("2") do |config|
   # backing providers for Vagrant. These expose provider-specific options.
   # Example for VirtualBox:
   #
-  # config.vm.provider "virtualbox" do |vb|
-  #   # Display the VirtualBox GUI when booting the machine
-  #   vb.gui = true
-  #
-  #   # Customize the amount of memory on the VM:
-  #   vb.memory = "1024"
-  # end
+  config.vm.provider "virtualbox" do |vb|
+    # Customize the amount of memory on the VM:
+    vb.memory = "2048"
+  end
   #
   # View the documentation for the provider you are using for more
   # information on available options.
@@ -67,7 +64,7 @@ Vagrant.configure("2") do |config|
      apt-get update
      apt-get install -y git vim curl
      echo 'curl https://sh.rustup.rs -sSf | sh -s -- -y;' | su vagrant
-     apt-get install -y autoconf automake cmake curl gcc liboauth-dev libssl-dev libsasl2-dev libtool patch python ntp unzip libboost-all-dev pkg-config
+     apt-get install -y autoconf automake cmake curl gcc liboauth-dev libssl-dev libsasl2-dev libtool patch python ntp unzip libboost-all-dev pkg-config g++ ccache
 
   SHELL
 end
