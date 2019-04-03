@@ -16,7 +16,7 @@ impl Message {
         Self {
             from: "".to_string(),
             to: "".to_string(),
-            ty: "timeout".to_string(),
+            ty: "message".to_string(),
             body: json!({}),
             raw: Vec::new()
         }
