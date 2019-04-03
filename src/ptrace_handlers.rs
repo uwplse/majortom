@@ -9,16 +9,86 @@ use nix::sched::CloneFlags;
 use libc::user_regs_struct;
 use bincode::{serialize, deserialize};
 use std::mem::size_of;
-use failure::Error;
+use failure::{ResultExt, Error};
+use tempfile::{TempDir};
+use std::rc::Rc;
+use std::cell::RefCell;
 
 use crate::data;
 
 #[derive(Debug, Clone)]
 enum File {
     UDPSocket(Option<SocketAddress>),
-    GlobalFile(String),
-//  LocalFile(String),
+    ReadFile(String),
+    WriteFile(String),
     Special
+}
+
+#[derive(Debug)]
+struct FileSystemSnapshot {
+    dir: TempDir,
+    files: HashMap<String, Option<String>>,
+    files_to_restore: Vec<String>,
+    filenumber: i32
+}
+
+fn is_read_only(flags: i32) -> bool {
+    (flags & libc::O_ACCMODE) == libc::O_RDONLY
+}
+
+impl FileSystemSnapshot {
+    fn new() -> Result<Self, Error> {
+        Ok(Self {
+            dir: tempfile::Builder::new().prefix("files").tempdir()?,
+            files: HashMap::new(),
+            files_to_restore: Vec::new(),
+            filenumber: 0
+        })
+    }
+
+    fn snapshot_file(&mut self, filename: String) -> Result<(), Error> {
+        if !self.files.contains_key(&filename) {
+            let name = self.filenumber.to_string();
+            self.filenumber += 1;
+            let path = self.dir.path().join(name);
+            if std::path::Path::new(&filename).exists() {
+                std::fs::copy(&filename, &path)?;
+                self.files.insert(filename, Some(path.to_str().unwrap().to_owned()));
+            } else {
+                self.files.insert(filename, None);
+            }
+        }
+        Ok(())
+    }
+
+    fn mark_for_restoration(&mut self, filename: String) {
+        assert!(self.files.contains_key(&filename));
+        self.files_to_restore.push(filename);
+    }
+    
+    fn restore_snapshot(&self) -> Result<(), Error> {
+        trace!("Restoring snapshot {:?}", self);
+        for file in self.files_to_restore.iter() {
+            let snapshot = self.files.get(&file.clone()).unwrap();
+            trace!("Restoring {} from {:?}", file, snapshot);
+            match snapshot {
+                Some(snapshot) => {
+                    trace!("Copying {} to {}", snapshot, file);
+                    std::fs::copy(snapshot, file)?;
+                }
+                None => {
+                    if std::path::Path::new(&file).exists() {
+                        trace!("Deleting {}", file);
+                        std::fs::remove_file(file)?;
+                    } else {
+                        trace!("{} doesn't exist and shouldn't--we're good",
+                               file);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -26,6 +96,7 @@ struct TracedProcess {
     tgid: Pid,
     tid: Pid,
     files: HashMap<i32, File>,
+    snapshot: Rc<RefCell<FileSystemSnapshot>>
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -116,7 +187,8 @@ enum Syscall {
     MProtect,
     ArchPrctl,
     Access(String),
-    Open(String),
+    // filename, flags
+    Open(String, i32),
     Stat,
     Fstat(i32, File),
     MMap(i32, Option<File>),
@@ -139,7 +211,8 @@ enum Syscall {
     SigAltStack,
     SchedSetAffinity,
     SchedGetAffinity,
-    Upcall(usize)
+    LSeek,
+    Upcall(usize),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -159,7 +232,8 @@ impl TracedProcess {
         let proc = match fork()? {
             ForkResult::Parent {child, ..} => {
                 trace!("Started child with pid {}", child);
-                Self {tgid: child, tid: child, files: files}
+                Self {tgid: child, tid: child, files: files,
+                      snapshot: Rc::new(RefCell::new(FileSystemSnapshot::new()?))}
             },
             ForkResult::Child => {
                 ptrace::traceme().expect("couldn't call trace");
@@ -192,6 +266,7 @@ impl TracedProcess {
                            status)
             }
         }
+        self.snapshot.borrow().restore_snapshot().context("Restoring snapshot")?;
         Ok(())
     }
 
@@ -227,7 +302,8 @@ impl TracedProcess {
             _ => bail!("Bad status when trying to get clone info: {:?}", status)
         }
         let child = Pid::from_raw(ptrace::getevent(self.tid)? as i32);
-        let proc = Self {tgid: self.tgid, tid: child, files: (&self.files).clone()};
+        let proc = Self {tgid: self.tgid, tid: child, files: (&self.files).clone(),
+                         snapshot: (&self.snapshot).clone()};
         proc.wait_for_process_start()?;
         Ok((child, proc))
     }
@@ -378,7 +454,13 @@ impl TracedProcess {
             }
             2 => { //open()
                 let s = self.read_string(regs.rdi)?;
-                Ok(Syscall::Open(s))
+                let flags = regs.rsi as i32;
+                if !is_read_only(flags) {
+                    // snapshot file here: even though the open might not
+                    // succeed, if it does it could create or truncate the file
+                    self.snapshot.borrow_mut().snapshot_file(s.clone())?;
+                }
+                Ok(Syscall::Open(s, flags))
             }
             3 => { //close()
                 let fd = regs.rdi as i32;
@@ -396,7 +478,8 @@ impl TracedProcess {
                 } else {
                     bail!("fstat() called on unknown file")
                 }
-            }
+            },
+            8 => Ok(Syscall::LSeek),
             9 => { // mmap(), only supported for global files for now
                 let fd = regs.r8 as i32;
                 if fd < 0 {
@@ -491,11 +574,19 @@ impl TracedProcess {
             SyscallReturn::Success(sys_ret)
         };
         match (call, ret) {
-            (Syscall::Open(filename), SyscallReturn::Success(fd)) => {
+            (Syscall::Open(filename, flags), SyscallReturn::Success(fd)) => {
                 let fd = fd as i32;
-                // TODO: identify local files
-                let file = File::GlobalFile(filename);
-                trace!("Adding file {} -> {:?} to proc {:?}", fd, file, self);
+                let file =
+                    if (flags & libc::O_ACCMODE) == libc::O_RDONLY {
+                        // this is a read-only file, so we don't need to worry too
+                        // much about it
+                        File::ReadFile(filename)
+                    } else {
+                        // this file might be written too, so we need to save a
+                        // copy of it
+                        self.snapshot.borrow_mut().mark_for_restoration(filename.clone());
+                        File::WriteFile(filename)
+                    };
                 self.files.insert(fd, file);
             }
             (Syscall::Close(fd, _), SyscallReturn::Success(_)) => {
@@ -655,19 +746,21 @@ impl Handlers {
             match &call {
                 Syscall::Read(_, file) => {
                     match file {
-                        File::GlobalFile(_) | File::Special => (),
+                        File::ReadFile(_) | File::WriteFile(_) | File::Special => (),
                         _ => bail!("Unsupported read of file {:?}", file)
                     }
                 }
                 Syscall::Write(_, file) => {
                     match file {
                         File::Special => (),
+                        File::WriteFile(_) => (),
                         _ => bail!("Unsupported write to file {:?}", file)
                     }
                 }
                 Syscall::MMap(_, Some(file)) => {
                     match file {
-                        File::GlobalFile(_) => (),
+                        File::ReadFile(_) => (),
+                        File::WriteFile(_) => (),
                         _ => bail!("Unsupported mmap on file {:?}", file)
                     }
                 },

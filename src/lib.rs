@@ -18,7 +18,7 @@ extern crate log;
 extern crate fern;
 extern crate chrono;
 extern crate libc;
-
+extern crate tempfile;
 
 pub mod config;
 pub mod oddity;
