@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use nix::unistd::{Pid, fork, ForkResult,execv};
 use nix::sys::ptrace;
@@ -13,6 +13,7 @@ use failure::{ResultExt, Error};
 use tempfile::{TempDir};
 use std::rc::Rc;
 use std::cell::RefCell;
+
 
 use crate::data;
 
@@ -29,7 +30,8 @@ struct FileSystemSnapshot {
     dir: TempDir,
     files: HashMap<String, Option<String>>,
     files_to_restore: Vec<String>,
-    filenumber: i32
+    filenumber: i32,
+    directories: HashSet<String>
 }
 
 fn is_read_only(flags: i32) -> bool {
@@ -42,6 +44,7 @@ impl FileSystemSnapshot {
             dir: tempfile::Builder::new().prefix("files").tempdir()?,
             files: HashMap::new(),
             files_to_restore: Vec::new(),
+            directories: HashSet::new(),
             filenumber: 0
         })
     }
@@ -61,6 +64,12 @@ impl FileSystemSnapshot {
         Ok(())
     }
 
+    fn snapshot_directory(&mut self, filename: String) {
+        if !self.directories.contains(&filename) {
+            self.directories.insert(filename.clone());
+        }
+    }
+
     fn mark_for_restoration(&mut self, filename: String) {
         assert!(self.files.contains_key(&filename));
         self.files_to_restore.push(filename);
@@ -68,6 +77,15 @@ impl FileSystemSnapshot {
     
     fn restore_snapshot(&self) -> Result<(), Error> {
         trace!("Restoring snapshot {:?}", self);
+        for directory in self.directories.iter() {
+            if std::path::Path::new(&directory).exists() {
+                trace!("Deleting directory: {}", directory);
+                std::fs::remove_dir_all(directory)?;
+            } else {
+                trace!("Directory {} doesn't exist and shouldn't--we're good",
+                       directory);
+            }
+        }
         for file in self.files_to_restore.iter() {
             let snapshot = self.files.get(&file.clone()).unwrap();
             trace!("Restoring {} from {:?}", file, snapshot);
@@ -78,7 +96,7 @@ impl FileSystemSnapshot {
                 }
                 None => {
                     if std::path::Path::new(&file).exists() {
-                        trace!("Deleting {}", file);
+                        trace!("Deleting file: {}", file);
                         std::fs::remove_file(file)?;
                     } else {
                         trace!("{} doesn't exist and shouldn't--we're good",
@@ -150,7 +168,9 @@ impl TimeoutIdGenerator {
     }
 
     fn next(&mut self) -> TimeoutId {
-        TimeoutId {id: self.next_id}
+        let next = TimeoutId {id: self.next_id};
+        self.next_id += 1;
+        next
     }
 }
 
@@ -212,6 +232,7 @@ enum Syscall {
     SchedSetAffinity,
     SchedGetAffinity,
     LSeek,
+    MkDir(String),
     Upcall(usize),
 }
 
@@ -546,6 +567,10 @@ impl TracedProcess {
                 let flags = CloneFlags::from_bits(regs.rdi as i32)
                     .ok_or(format_err!("Invalid clone() flags"))?;
                 Ok(Syscall::Clone(flags))
+            },
+            83 => { // mkdir()
+                let path = self.read_string(regs.rdi)?;
+                Ok(Syscall::MkDir(path))
             }
             97 => Ok(Syscall::GetRLimit),
             131 => Ok(Syscall::SigAltStack),
@@ -609,6 +634,11 @@ impl TracedProcess {
                 } else {
                     bail!("bind() called on unknown file")
                 }
+            }
+            (Syscall::MkDir(path), SyscallReturn::Success(_)) => {
+                // we successfully made a directory, so we're going to want to
+                // remove it
+                self.snapshot.borrow_mut().snapshot_directory(path);
             }
             _ => ()
         };

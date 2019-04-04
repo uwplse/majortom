@@ -21,3 +21,7 @@ pub fn setup_example(example: &str) -> config::Config {
         .expect("Failed to read config file");
     config
 }
+
+pub fn path_exists(s: &str) -> bool {
+    std::path::Path::new(s).exists()
+}
