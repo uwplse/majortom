@@ -1,10 +1,18 @@
+extern crate env_logger;
+
 use std::path::PathBuf;
 use std::env::set_current_dir;
 use std::process::{Command, Stdio};
 
 use majortom::{config};
 
+
+pub fn setup_logging() {
+    let _ = env_logger::builder().is_test(true).try_init();
+}
+
 pub fn setup_example(example: &str) -> config::Config {
+    setup_logging();
     let mut example_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     example_path.push("examples");
     example_path.push(example);

@@ -22,3 +22,6 @@ tempfile = "3.0.7"
 
 [dependencies.libc]
 version = "0.2"
+
+[dev-dependencies]
+env_logger = "0.6.1"
