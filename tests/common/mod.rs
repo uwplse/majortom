@@ -3,6 +3,7 @@ extern crate env_logger;
 use std::path::PathBuf;
 use std::env::set_current_dir;
 use std::process::{Command, Stdio};
+use log::trace;
 
 use majortom::{config};
 
@@ -20,11 +21,13 @@ pub fn setup_example(example: &str) -> config::Config {
         panic!("No example named {}", example);
     }
     set_current_dir(example_path).expect("Couldn't change directories");
-    let make_status = Command::new("make").stdout(Stdio::null()).status()
+    trace!("Running make");
+    let make_status = Command::new("make").stdout(Stdio::null()).stderr(Stdio::null()).status()
         .expect("Couldn't run make");
     if !make_status.success() {
         panic!("Failed to build example {}", example)
     }
+    trace!("Make finished");
     let config = config::read(&format!("{}.toml", example))
         .expect("Failed to read config file");
     config
