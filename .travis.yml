@@ -1,4 +1,6 @@
 language: rust
+before_install:
+  - ls examples/fs/
 env:
   - RUST_LOG=majortom=trace RUST_TEST_THREADS=1 RUST_BACKTRACE=1
 notifications:
