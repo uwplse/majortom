@@ -3,7 +3,7 @@ use std::ffi::CString;
 use nix::unistd::{Pid, fork, ForkResult,execv};
 use nix::sys::ptrace;
 use nix::sys::wait::{waitpid, WaitStatus, WaitPidFlag};
-use nix::sys::signal::{kill, Signal};
+use nix::sys::signal::Signal;
 use nix::sys::socket::{AddressFamily, SockProtocol, SockType, sockaddr_storage, sockaddr_in};
 use nix::sched::CloneFlags;
 use libc::user_regs_struct;
@@ -278,7 +278,7 @@ impl TracedProcess {
         // should only kill group leaders
         assert!(self.tid == self.tgid);
         trace!("Killing process {:?}", self);
-        kill(self.tid, Signal::SIGKILL)?;
+        ptrace::kill(self.tid)?;
         for _i in 0..nthreads {
             let status = self.wait_status()?;
             match status {
