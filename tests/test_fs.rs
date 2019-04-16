@@ -6,6 +6,7 @@ mod common;
 
 use common::{setup_example, path_exists};
 
+#[ignore]
 #[test]
 fn test_files() {
     let config = setup_example("fs");
@@ -57,6 +58,7 @@ fn test_files() {
     }
 }
 
+#[ignore]
 #[test]
 fn test_directory() {
     let config = setup_example("fs");
