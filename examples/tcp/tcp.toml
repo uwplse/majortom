@@ -1,0 +1,9 @@
+[oddity]
+address="10.0.2.2:4343"
+
+[nodes]
+client1="./client 8001"
+client2="./client 8001"
+client3="./client 8001"
+client4="./client 8001"
+server="./server 8001"

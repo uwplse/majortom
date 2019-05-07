@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 extern crate env_logger;
 
 use std::path::PathBuf;

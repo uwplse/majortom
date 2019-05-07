@@ -7,7 +7,7 @@ pub struct Message {
     #[serde(rename="type")]
     pub ty: String,
     pub body: j::Value,
-    pub raw: Vec<u8>
+    pub raw: j::Value
 }
 
 
@@ -18,7 +18,7 @@ impl Message {
             to: "".to_string(),
             ty: "message".to_string(),
             body: json!({}),
-            raw: Vec::new()
+            raw: json!({})
         }
     }
 }

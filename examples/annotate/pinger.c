@@ -35,7 +35,7 @@ int main(int argc, char** argv) {
     return -1;
   }
   struct addrinfo mehints, *meres;
-  char buf[5];
+  char buf[5] = "";
   int pongs_received = 0;
 
   memset(&mehints, 0, sizeof mehints);
@@ -70,11 +70,16 @@ int main(int argc, char** argv) {
   pthread_t tid;
   int secs = 5;
   pthread_create(&tid, NULL, background, &secs);
+  int remote_port = 0;
   while(1) {
     annotate_message("ping");
+    int_field("remote_port", remote_port);
+    str_field("remote_text", buf);
     sendto(sockfd, "ping", 5, 0, themres->ai_addr, themres->ai_addrlen);
     pings_sent++;
     recvfrom(sockfd, buf, 5, 0, &from, &fromsize);
+    struct sockaddr_in *from_in = (struct sockaddr_in*)&from;
+    remote_port = (int)ntohs(from_in->sin_port);
     pongs_received++;
   }
 }

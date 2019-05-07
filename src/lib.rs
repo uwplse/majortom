@@ -19,6 +19,8 @@ extern crate fern;
 extern crate chrono;
 extern crate libc;
 extern crate tempfile;
+extern crate base64;
+extern crate base64_serde;
 
 pub mod config;
 pub mod oddity;

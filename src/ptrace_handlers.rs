@@ -1,24 +1,29 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
+use std::net::{TcpListener, TcpStream};
 use nix::unistd::{Pid, fork, ForkResult,execv};
 use nix::sys::ptrace;
 use nix::sys::wait::{waitpid, WaitStatus, WaitPidFlag};
-use nix::sys::signal::Signal;
 use nix::sys::socket::{AddressFamily, SockProtocol, SockType, sockaddr_storage, sockaddr_in};
 use nix::sched::CloneFlags;
 use libc::user_regs_struct;
-use bincode::{serialize, deserialize};
 use std::mem::size_of;
+use std::slice;
 use failure::{ResultExt, Error};
 use tempfile::{TempDir};
 use std::rc::Rc;
 use std::cell::RefCell;
+use base64_serde::base64_serde_type;
+use std::fmt;
+use std::io::{Read,Write};
 
+base64_serde_type!(Base64Standard, base64::STANDARD);
 
 use crate::data;
 
 #[derive(Debug, Clone)]
 enum File {
+    TcpSocket(Option<SocketAddress>),
     UDPSocket(Option<SocketAddress>),
     ReadFile(String),
     WriteFile(String),
@@ -37,6 +42,58 @@ struct FileSystemSnapshot {
 fn is_read_only(flags: i32) -> bool {
     (flags & libc::O_ACCMODE) == libc::O_RDONLY
 }
+
+struct TcpChannel {
+    remote: Option<TcpStream>,
+    listener: Option<TcpListener>,
+    local: Option<TcpStream>,
+    sent: Rc<RefCell<usize>>,
+    received: Rc<RefCell<usize>>,
+    delivered: Rc<RefCell<usize>>,
+    remote_addr: Option<SocketAddress>
+}
+
+impl TcpChannel {
+    fn new() -> Self {
+        Self {
+            remote: None,
+            listener: None,
+            local: None,
+            sent: Rc::new(RefCell::new(0)),
+            received: Rc::new(RefCell::new(0)),
+            delivered: Rc::new(RefCell::new(0)),
+            remote_addr: None
+        }
+    }
+
+    fn reverse(&self, addr: SocketAddress) -> Self {
+        Self {
+            remote: match self.local {
+                None => None,
+                Some(ref s) =>
+                    Some(s.try_clone().unwrap())
+            },
+            listener: self.listener.as_ref().map(|s| s.try_clone().unwrap()),
+            local: self.remote.as_ref().map(|s| s.try_clone().unwrap()),
+            sent: self.received.clone(),
+            received: self.sent.clone(),
+            delivered: Rc::new(RefCell::new(0)),
+            remote_addr: Some(addr)
+        }
+    }
+
+    fn send(&self, len: usize) {
+        *self.sent.borrow_mut() += len;
+    }
+}
+
+/*
+impl TcpChannel {
+    fn reverse(&self) -> Self {
+        Self {remote: self.local.clone(),
+              local: self.remote.clone()}
+    }
+}*/
 
 impl FileSystemSnapshot {
     fn new() -> Result<Self, Error> {
@@ -113,8 +170,20 @@ impl FileSystemSnapshot {
 struct TracedProcess {
     tgid: Pid,
     tid: Pid,
-    files: HashMap<i32, File>,
-    snapshot: Rc<RefCell<FileSystemSnapshot>>
+    files: Rc<RefCell<HashMap<i32, File>>>,
+    snapshot: Rc<RefCell<FileSystemSnapshot>>,
+    counter: Rc<RefCell<u64>>
+}
+
+impl fmt::Display for TracedProcess {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        if self.tgid == self.tid {
+            write!(f, "TracedProcess({})", self.tgid)
+        }
+        else {
+            write!(f, "TracedProcess({}/{})", self.tgid, self.tid)
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -174,11 +243,21 @@ impl TimeoutIdGenerator {
     }
 }
 
+#[derive(PartialEq, Serialize, Deserialize, Debug, Clone)]
+enum MessageData {
+    TcpConnect(u64),
+    TcpAck(String),
+    #[serde(with = "Base64Standard")]
+    Data(Vec<u8>),
+    TcpMessage(usize)
+}
+
+
 #[derive(Serialize, Deserialize)]
 struct WireMessage {
     from: Option<SocketAddress>,
     to: SocketAddress,
-    data: Vec<u8>
+    data: MessageData
 }
 
 pub struct Handlers {
@@ -188,17 +267,21 @@ pub struct Handlers {
     timeout_id_generator: TimeoutIdGenerator,
     timeout_waiting_procs: HashMap<TimeoutId, (TracedProcessIdentifier, Syscall)>,
     address_to_name: HashMap<SocketAddress, String>,
+    tcp_channels: HashMap<(String, u64), TcpChannel>,
     current_timeout: Option<data::Timeout>,
     current_message: Option<data::Message>,
     current_state: Option<serde_json::Value>,
-    annotate_state_procs: HashMap<TracedProcessIdentifier, TracedProcessIdentifier>
+    annotate_state_procs: HashMap<TracedProcessIdentifier, TracedProcessIdentifier>,
+    current_tcp_message: Option<(SocketAddress, usize)>
 }
 
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 enum SocketAddress {
     // for now, we only care about the port.
-    IPV4(u16), IPV6(u16)
+    IPV4(u16), IPV6(u16),
+    // fake socket address for Tcp streams
+    TcpStream(String, u64)
 }
 
 #[derive(Debug, Clone)]
@@ -216,13 +299,17 @@ enum Syscall {
     Close(i32, File),
     Read(i32, File),
     UDPSocket,
+    TcpSocket,
     Bind(i32, SocketAddress),
+    Listen(i32, i32),
+    Connect(i32, File, SocketAddress),
+    Accept(i32, File),
     Write(i32, File),
-    RecvFrom(i32, File),
+    RecvFrom(i32, File, usize),
     SigProcMask,
     SigAction,
     NanoSleep,
-    SendTo(i32, File, SocketAddress, Vec<u8>),
+    SendTo(i32, File, Option<SocketAddress>, Vec<u8>),
     SetTidAddress,
     SetRobustList,
     Futex,
@@ -233,6 +320,7 @@ enum Syscall {
     SchedGetAffinity,
     LSeek,
     MkDir(String),
+    SetSockOpt(i32, i32, i32),
     Upcall(usize),
 }
 
@@ -253,7 +341,8 @@ impl TracedProcess {
         let proc = match fork()? {
             ForkResult::Parent {child, ..} => {
                 trace!("Started child with pid {}", child);
-                Self {tgid: child, tid: child, files: files,
+                Self {tgid: child, tid: child, files: Rc::new(RefCell::new(files)),
+                      counter: Rc::new(RefCell::new(0)),
                       snapshot: Rc::new(RefCell::new(FileSystemSnapshot::new()?))}
             },
             ForkResult::Child => {
@@ -272,6 +361,11 @@ impl TracedProcess {
             |ptrace::Options::PTRACE_O_TRACEVFORK;
         ptrace::setoptions(proc.tid, options)?;
         Ok(proc)
+    }
+
+    fn next_counter(&self) -> u64 {
+        *self.counter.borrow_mut() += 1;
+        *self.counter.borrow()
     }
     
     fn kill(&self, nthreads: usize) -> Result<(), Error> {
@@ -323,8 +417,9 @@ impl TracedProcess {
             _ => bail!("Bad status when trying to get clone info: {:?}", status)
         }
         let child = Pid::from_raw(ptrace::getevent(self.tid)? as i32);
-        let proc = Self {tgid: self.tgid, tid: child, files: (&self.files).clone(),
-                         snapshot: (&self.snapshot).clone()};
+        let proc = Self {tgid: self.tgid, tid: child, files: self.files.clone(),
+                         counter: Rc::clone(&self.counter),
+                         snapshot: Rc::clone(&self.snapshot)};
         proc.wait_for_process_start()?;
         Ok((child, proc))
     }
@@ -369,11 +464,14 @@ impl TracedProcess {
                 // interested in the underlying bytes, which means that we're
                 // interested in the c_long's representation *on this
                 // architecture*.
-                buf = ptrace::read(self.tid, (addr + (i as u64)) as ptrace::AddressType)?.to_ne_bytes();
+                let raw = ptrace::read(self.tid, (addr + (i as u64)) as ptrace::AddressType)?;
+                buf = raw.to_ne_bytes();
+                trace!("Read {:?} ({:?}) from process memory at {:?}", buf, raw, addr);
             }
             bytes.push(buf[i % size_of::<libc::c_long>()]);
             // addr incremented once for each *byte* read
         }
+        trace!("read bytes {:?}", bytes);
         Ok(bytes)
     }
 
@@ -419,23 +517,27 @@ impl TracedProcess {
                     bail!("Insufficient storage");
                 }
                 let sa: sockaddr_in = self.read(addr)?;
-                Ok(SocketAddress::IPV4(sa.sin_port.to_be()))
+                Ok(SocketAddress::IPV4(u16::from_be(sa.sin_port)))
             } else {
                 bail!("Unsupported address family")
             }
         }
     }
 
-    fn write_data(&self, addr: u64, addrlen: usize, data: Vec<u8>) -> Result<usize, Error> {
+    fn write_data(&self, addr: u64, data: Vec<u8>) -> Result<usize, Error> {
         let mut buf : [u8; size_of::<libc::c_long>()] = [0; size_of::<libc::c_long>()];
-        let length = std::cmp::max(addrlen, data.len());
+        let length = data.len();
+        trace!("Going to write {:?} bytes into process memory at {:?}", length, addr);
+        trace!("Writing {:?}", data);
         for (i, b) in data.iter().enumerate() {
             buf[i % size_of::<libc::c_long>()] = *b;
             if ((i + 1) % size_of::<libc::c_long>() == 0) ||
                 i + 1 == length {
-                let word = libc::c_long::from_ne_bytes(buf);
-                ptrace::write(self.tid, (addr + (i as u64)) as ptrace::AddressType,
-                              word as *mut libc::c_void)?;
+                    let word = u64::from_ne_bytes(buf);
+                    trace!("Writing {:?} ({:?}) to process memory at {:?}", buf, word, addr);
+                    let index = (i / size_of::<libc::c_long>()) * size_of::<libc::c_long>();
+                    ptrace::write(self.tid, (addr + (index as u64)) as ptrace::AddressType,
+                                  word as *mut libc::c_void)?;
             }
             // exit early if we're not iterating over whole vector
             if i + 1 == length {
@@ -445,10 +547,46 @@ impl TracedProcess {
         Ok(length)
     }
 
-    //TODO implement this
-    fn write_socket_address(&self, _addr_ptr: u64, _addrlen: usize,
-                            _addr: Option<SocketAddress>)
+    unsafe fn write<T>(&self, addr: u64, t: T) -> Result<(), Error> where T: Copy {
+        trace!("size_of(T) is {:?} bytes", size_of::<T>());
+        unsafe {
+            let p: *const T = &t;     // the same operator is used as with references
+            let p: *const u8 = p as *const u8;  // convert between pointer types
+            let s: &[u8] = unsafe { 
+                slice::from_raw_parts(p, size_of::<T>())
+            };
+            self.write_data(addr, s.into())?;
+        }
+        Ok(())
+    }
+    
+
+    fn write_socket_address(&self, addr_ptr: u64, addrlen: usize,
+                            addr: Option<SocketAddress>)
                             -> Result<(), Error> {
+        if let Some(addr) = addr {
+            match addr {
+                SocketAddress::IPV4(port) => {
+                    if addrlen < size_of::<sockaddr_in>() {
+                        bail!("Insufficient storage")
+                    }
+                    let localhost_le: u32 = std::net::Ipv4Addr::LOCALHOST.into();
+                    let localhost = localhost_le.to_be(); 
+                    let sa: sockaddr_in = sockaddr_in {
+                        sin_family: (AddressFamily::Inet as u16),
+                        sin_port: port.to_be(),
+                        sin_addr: libc::in_addr {
+                            s_addr: localhost
+                        },
+                        sin_zero: [0; 8]
+                    };
+                    unsafe {
+                        self.write(addr_ptr, sa)?;
+                    }
+                }
+                _ => bail!("attempt to write bad socket address")
+            }
+        }
         Ok(())
     }
     
@@ -459,7 +597,7 @@ impl TracedProcess {
         let call = match call_number {
             0 => { //read()
                 let fd = regs.rdi as i32;
-                if let Some(file) = self.files.get(&fd) {
+                if let Some(file) = self.files.borrow().get(&fd) {
                     Ok(Syscall::Read(fd, file.clone()))
                 } else {
                     bail!("read() called on unknown file")
@@ -467,7 +605,7 @@ impl TracedProcess {
             },
             1 => { //write()
                 let fd = regs.rdi as i32;
-                if let Some(file) = self.files.get(&fd) {
+                if let Some(file) = self.files.borrow().get(&fd) {
                     Ok(Syscall::Write(fd, file.clone()))
                 } else {
                     bail!("write() called on unknown file")
@@ -485,7 +623,7 @@ impl TracedProcess {
             }
             3 => { //close()
                 let fd = regs.rdi as i32;
-                if let Some(file) = self.files.get(&fd) {
+                if let Some(file) = self.files.borrow().get(&fd) {
                     Ok(Syscall::Close(fd, file.clone()))
                 } else {
                     bail!("close() called on unknown file")
@@ -494,7 +632,7 @@ impl TracedProcess {
             4 => Ok(Syscall::Stat),
             5 => { //fstat()
                 let fd = regs.rdi as i32;
-                if let Some(file) = self.files.get(&fd) {
+                if let Some(file) = self.files.borrow().get(&fd) {
                     Ok(Syscall::Fstat(fd, file.clone()))
                 } else {
                     bail!("fstat() called on unknown file")
@@ -506,7 +644,7 @@ impl TracedProcess {
                 if fd < 0 {
                     Ok(Syscall::MMap(fd, None))
                 } else {
-                    if let Some(file) = self.files.get(&fd) {
+                    if let Some(file) = self.files.borrow().get(&fd) {
                         Ok(Syscall::MMap(fd, Some(file.clone())))
                     } else {
                         bail!("mmap() called on unknown file")
@@ -534,16 +672,48 @@ impl TracedProcess {
                     socket_type == SockType::Datagram as i32 &&
                     socket_protocol == SockProtocol::Udp as i32 {
                     Ok(Syscall::UDPSocket)
-                }
+                    }
+                else if (socket_family == AddressFamily::Inet as i32 ||
+                    socket_family == AddressFamily::Inet6 as i32) &&
+                    socket_type == SockType::Stream as i32 &&
+                    socket_protocol == SockProtocol::Tcp as i32 {
+                    Ok(Syscall::TcpSocket)
+                    }
                 else {
                     bail!("Unsupported socket({}, {}, {})",
                            socket_family, socket_type, socket_protocol);
                 }
             },
+            42 => { // connect()
+                let fd = regs.rdi as i32;
+                if let Some(sock) = self.files.borrow().get(&fd) {
+                    match sock {
+                        File::TcpSocket(_) => {
+                            let socket_address = self.read_socket_address(regs.rsi, regs.rdx as usize)?;
+                            Ok(Syscall::Connect(fd, sock.clone(), socket_address))
+                        }
+                        _ => bail!("connect() called on bad file {:?}", sock)
+                    }
+                } else {
+                    bail!("connect() called on unknown file");
+                }
+            },
+            43 => { // accept()
+                let fd = regs.rdi as i32;
+                if let Some(sock) = self.files.borrow().get(&fd) {
+                    Ok(Syscall::Accept(fd, sock.clone()))
+                } else {
+                    bail!("accept() called on unknown file")
+                }
+            },
             44 => { // sendto()
                 let fd = regs.rdi as i32;
-                if let Some(sock) = self.files.get(&fd) {
-                    let socket_address = self.read_socket_address(regs.r8, regs.r9 as usize)?;
+                if let Some(sock) = self.files.borrow().get(&fd) {
+                    let socket_address = if regs.r8 != 0 {
+                        Some(self.read_socket_address(regs.r8, regs.r9 as usize)?)
+                    } else {
+                        None
+                    };
                     let data = self.read_data(regs.rsi, regs.rdx as usize)?;
                     Ok(Syscall::SendTo(fd, sock.clone(), socket_address, data))
                 } else {
@@ -552,8 +722,9 @@ impl TracedProcess {
             }
             45 => { // recvfrom()
                 let fd = regs.rdi as i32;
-                if let Some(sock) = self.files.get(&fd) {
-                    Ok(Syscall::RecvFrom(fd, sock.clone()))
+                let size = regs.rdx as usize;
+                if let Some(sock) = self.files.borrow().get(&fd) {
+                    Ok(Syscall::RecvFrom(fd, sock.clone(), size))
                 } else {
                     bail!("recvfrom() called on unknown file")
                 }
@@ -562,6 +733,17 @@ impl TracedProcess {
                 let fd = regs.rdi as i32;
                 let socket_address = self.read_socket_address(regs.rsi, regs.rdx as usize)?;
                 Ok(Syscall::Bind(fd, socket_address))
+            },
+            50 => { // listen()
+                let fd = regs.rdi as i32;
+                let backlog = regs.rsi as i32;
+                Ok(Syscall::Listen(fd, backlog))
+            },
+            54 => { // setsockopt()
+                let fd = regs.rdi as i32;
+                let level = regs.rsi as i32;
+                let opt = regs.rdx as i32;
+                Ok(Syscall::SetSockOpt(fd, level, opt))
             },
             56 => { // clone()
                 let flags = CloneFlags::from_bits(regs.rdi as i32)
@@ -612,28 +794,44 @@ impl TracedProcess {
                         self.snapshot.borrow_mut().mark_for_restoration(filename.clone());
                         File::WriteFile(filename)
                     };
-                self.files.insert(fd, file);
+                self.files.borrow_mut().insert(fd, file);
             }
             (Syscall::Close(fd, _), SyscallReturn::Success(_)) => {
                 trace!("Removing file {} from proc {:?}", fd, self);
-                self.files.remove(&fd);
+                self.files.borrow_mut().remove(&fd);
             }
             (Syscall::UDPSocket, SyscallReturn::Success(fd)) => {
                 let fd = fd as i32;
                 let file = File::UDPSocket(None);
-                self.files.insert(fd, file);
+                self.files.borrow_mut().insert(fd, file);
+            }
+            (Syscall::TcpSocket, SyscallReturn::Success(fd)) => {
+                let fd = fd as i32;
+                let file = File::TcpSocket(None);
+                self.files.borrow_mut().insert(fd, file);
             }
             (Syscall::Bind(fd, addr), SyscallReturn::Success(_)) => {
-                if let Some(sock) = self.files.get_mut(&fd) {
-                    trace!("Binding {:?} to {:?}", sock, addr);
-                    let new_sock = match sock {
-                        File::UDPSocket(_) => File::UDPSocket(Some(addr)),
-                        _ => bail!("bind() on bad file {:?}", sock)
-                    };
-                    self.files.insert(fd, new_sock);
-                } else {
-                    bail!("bind() called on unknown file")
+                let mut files = self.files.borrow_mut();
+                let mut sock = files.get_mut(&fd);
+                match sock.iter_mut().next() {
+                    Some(File::UDPSocket(v)) => {
+                        *v = Some(addr);
+                    }
+                    Some(File::TcpSocket(v)) => {
+                        *v = Some(addr);
+                    }
+                    _ => {
+                        bail!("bind() called on bad file");
+                    }
                 }
+                // if let Some(sock) = sock {
+                //     trace!("Binding {:?} to {:?}", sock, addr);
+                //     let new_sock = match sock {
+                //         File::UDPSocket(_) => File::UDPSocket(Some(addr)),
+                //         File::TcpSocket(_) => File::TcpSocket(Some(addr)),
+                //         _ => bail!("bind() on bad file {:?}", sock)
+                //     };
+                //     self.files.borrow_mut().insert(fd, new_sock);
             }
             (Syscall::MkDir(path), SyscallReturn::Success(_)) => {
                 // we successfully made a directory, so we're going to want to
@@ -682,8 +880,13 @@ impl TracedProcess {
         self.wait_on_syscall()?;
 
         // write to process memory
-        let written = self.write_data(buffer_ptr, buffer_len, data)?;
+        trace!("Writing to process memory: {:?}", data);
+        if buffer_len < data.len() {
+            bail!("Data don't fit in buffer");
+        }
+        let written = self.write_data(buffer_ptr, data)?;
         if addr_ptr != 0 {
+            trace!("Writing socket address");
             self.write_socket_address(addr_ptr, addr_len, addr)?;
         }
         // return data len
@@ -692,7 +895,56 @@ impl TracedProcess {
         self.set_registers(regs)?;
         Ok(())
     }
+
+    // allow kernel to handle accept() call, don't wait on return, but get
+    // register values
+    fn accept_continue(&self) -> Result<(u64, usize), Error> {
+        let regs = self.get_registers()?;
+        let addr_ptr = regs.rsi;
+        let addr_len = regs.rdx as usize;
+        self.run_until_syscall()?;
+        Ok((addr_ptr, addr_len))
+    }
+
+    fn accept_return(&mut self, addr_ptr: u64, addr_len: usize, addr: Option<SocketAddress>,
+                     local_addr: SocketAddress) -> Result<(), Error> {
+        self.wait_on_syscall()?;
+        let regs = self.get_registers()?;
+        let sys_ret = regs.rax as i64;
+        if sys_ret < 0 {
+            bail!("accept() failed");
+        }
+        let fd = sys_ret as i32;
+        self.files.borrow_mut().insert(fd, File::TcpSocket(Some(local_addr)));
+        if addr_ptr != 0 {
+            self.write_socket_address(addr_ptr, addr_len, addr)?;
+        }
+        Ok(())
+    }
+
+    fn connect_continue(&self, remote_addr: SocketAddress) -> Result<(), Error> {
+        let regs = self.get_registers()?;
+        let addr_ptr = regs.rsi;
+        let addr_len = regs.rdx as usize;
+        self.write_socket_address(addr_ptr, addr_len, Some(remote_addr))?;
+        self.run_until_syscall()?;
+        Ok(())
+    }
+
+    fn continue_return(&mut self, fd: i32, addr: SocketAddress) -> Result<(), Error> {
+        self.wait_on_syscall()?;
+        let regs = self.get_registers()?;
+        let sys_ret = regs.rax as i64;
+        if sys_ret < 0 {
+            bail!("continue() failed");
+        }
+        self.files.borrow_mut().insert(fd, File::TcpSocket(Some(addr)));
+        Ok(())
+    }
+
 }
+
+
 
 impl Handlers {
     pub fn new(nodes: HashMap<String, String>) -> Self {
@@ -701,9 +953,12 @@ impl Handlers {
               timeout_waiting_procs: HashMap::new(),
               annotate_state_procs: HashMap::new(),
               address_to_name: HashMap::new(),
+              tcp_channels: HashMap::new(),
               current_timeout: None,
               current_message: None,
-              current_state: None}
+              current_state: None,
+              current_tcp_message: None
+        }
     }
 
     pub fn servers(&self) -> Vec<&str> {
@@ -748,12 +1003,35 @@ impl Handlers {
         timeout
     }
 
-    fn get_current_message(&mut self, from: String, to: String, data: Vec<u8>) -> data::Message {
+    fn get_current_message(&mut self, from: String, to: String, data: serde_json::Value)
+                           -> data::Message {
         let mut message = self.current_message.take().unwrap_or_else(|| data::Message::new());
         message.from = from;
         message.to = to;
-        message.raw.extend(data);
+        message.raw = data;
         message
+    }
+
+    fn send_tcp_message(&mut self, response: &mut data::Response) -> Result<(), Error> {
+        if let Some((addr, bytes)) = self.current_tcp_message.take() {
+            match &addr {
+                SocketAddress::TcpStream(name, id) => {
+                    let channel = self.tcp_channels.get(&(name.to_string(), *id)).unwrap();
+                    let from = name;
+                    let to = self.address_to_name.get(&addr).unwrap();
+                    let raw = WireMessage {
+                        from: Some(addr.clone()),
+                        to: channel.remote_addr.clone().unwrap(),
+                        data: MessageData::TcpMessage(bytes)
+                    };
+                    let data = serde_json::to_value(&raw).unwrap();
+                    let message = self.get_current_message(from.to_string(), to.to_string(), data);
+                    response.messages.push(message);
+                }
+                _ => bail!("Bad TCP address")
+            }
+        }
+        Ok(())
     }
     
     /// Fills the response from any non-blocking syscalls made by proc procid
@@ -771,7 +1049,7 @@ impl Handlers {
                 &format!("Bad process identifier {:?}", procid));
             proc.run_until_syscall()?;
             let call = proc.get_syscall()?;
-            trace!("Process {:?} called Syscall {:?}", proc, call);
+            trace!("Process {} called Syscall {:?}", proc, call);
             // check for unsupported calls and panic if necessary
             match &call {
                 Syscall::Read(_, file) => {
@@ -794,26 +1072,102 @@ impl Handlers {
                         _ => bail!("Unsupported mmap on file {:?}", file)
                     }
                 },
-                Syscall::RecvFrom(_, file) => {
+                Syscall::RecvFrom(_, file, _) => {
                     match file {
                         File::UDPSocket(Some(_)) => (),
+                        File::TcpSocket(Some(SocketAddress::TcpStream(_, _))) => (),
                         _ => bail!("Unsupported recvfrom on file {:?}", file)
                     }
-                }
-                Syscall::SendTo(_, file, _, _) => {
+                },
+                Syscall::Accept(_, file) => {
                     match file {
-                        File::UDPSocket(_) => (),
+                        File::TcpSocket(Some(_)) => (),
+                        _ => bail!("Unsupported accept on file {:?}", file)
+                    }
+                }
+                Syscall::SendTo(_, file, addr, _) => {
+                    match (file, addr) {
+                        (File::UDPSocket(_), Some(_)) => (),
+                        (File::TcpSocket(Some(SocketAddress::TcpStream(_, _))), _) => (),
                         _ => bail!("Unsupported sendto on file {:?}", file)
+                    }
+                }
+                Syscall::Connect(_, file, _) => {
+                    match file {
+                        File::TcpSocket(_) => (),
+                        _ => bail!("Unsupported connect on file {:?}", file)
+                    }
+                }
+                Syscall::SetSockOpt(_, level, opt) => {
+                    match (*level, *opt) {
+                        (libc::SOL_SOCKET, libc::SO_REUSEADDR) => (),
+                        _ => bail!("Unsupported setsockopt: {}/{}", level, opt)
                     }
                 }
                 _ => ()
             }
             match &call {
-                Syscall::RecvFrom(_, File::UDPSocket(Some(addr))) => {
+                Syscall::RecvFrom(_, File::UDPSocket(Some(addr)), _) => {
                     proc.stop_syscall()?;
                     self.message_waiting_procs.insert(addr.clone(),
                                                       (procid.clone(), call.clone()));
                     // we're blocking, so we're done here
+                }
+                Syscall::RecvFrom(_, File::TcpSocket(Some(to_addr)), size) => {
+                    let to_addr = to_addr.clone();
+                    let channel = {
+                        match &to_addr {
+                            SocketAddress::TcpStream(name, id) => {
+                                self.tcp_channels.get(&(name.to_string(), *id)).unwrap()
+                            }
+                            _ => bail!("unexpected address")
+                        }
+                    };
+                    let delivered = *channel.delivered.borrow();
+                    if delivered > 0 {
+                        proc.run_until_syscall()?;
+                        let ret = proc.get_syscall_return(call)?;
+                        trace!("Process {} got syscall return {:?}", proc, ret);
+                        if let SyscallReturn::Success(value) = ret {
+                            *channel.delivered.borrow_mut() -= value as usize;
+                        }
+                        stack.push(procid.clone());
+                    } else {
+                        self.message_waiting_procs.insert(to_addr.clone(),
+                                                          (procid.clone(), call.clone()));
+                    }
+                }
+                Syscall::Connect(fd, File::TcpSocket(from_addr), to_addr) => {
+                    // don't stop the process
+                    if let Some(to) = self.address_to_name.get(&to_addr) {
+                        let counter = proc.next_counter();
+                        let listener = TcpListener::bind(("localhost", 0)).unwrap();
+                        let mut tcp_channel = TcpChannel::new();
+                        tcp_channel.listener = Some(listener);
+                        self.tcp_channels.insert((procid.name.clone(), counter), tcp_channel);
+                        let raw = WireMessage {from: from_addr.clone(),
+                                               to: to_addr.clone(),
+                                               data: MessageData::TcpConnect(counter)};
+                        let mut message = data::Message::new();
+                        message.from = procid.name.clone();
+                        message.to = to.clone();
+                        message.ty = "Tcp-Connect".to_string();
+                        message.raw = serde_json::to_value(&raw).unwrap();
+                        response.messages.push(message);
+                        let channel_addr = SocketAddress::TcpStream(procid.name.clone(), counter);
+                        self.address_to_name.insert(channel_addr.clone(), to.clone());
+                        self.message_waiting_procs.insert(channel_addr, (procid.clone(), call.clone()));
+                        // we're blocking waiting for a response, so we're done here
+                    }
+                    else {
+                        bail!("Connect to unknown address {:?}", to_addr);
+                    }
+                }
+                Syscall::Accept(_, File::TcpSocket(Some(addr))) => {
+                    // don't stop the process
+                    self.message_waiting_procs.insert(addr.clone(),
+                                                      (procid.clone(),
+                                                       call.clone()));
                 }
                 Syscall::NanoSleep => {
                     proc.stop_syscall()?;
@@ -824,14 +1178,17 @@ impl Handlers {
                     response.timeouts.push(timeout);
                     // we're blocking, so we're done here
                 }
-                Syscall::SendTo(_, File::UDPSocket(from_addr), to_addr, data) => {
+                // handle UDP send
+                Syscall::SendTo(_, File::UDPSocket(from_addr), Some(to_addr), data) => {
                     proc.stop_syscall()?;
                     if let Some(to) = self.address_to_name.get(&to_addr) {
                         proc.wake_from_stopped_call(call.clone())?;
-                        let raw = WireMessage {from: from_addr.clone(), to: to_addr.clone(), data: data.clone()};
+                        let raw = WireMessage {from: from_addr.clone(),
+                                               to: to_addr.clone(),
+                                               data: MessageData::Data(data.clone())};
                         let message = self.get_current_message(procid.name.clone(),
                                                                to.clone(),
-                                                               serialize(&raw).unwrap());
+                                                               serde_json::to_value(&raw).unwrap());
                         response.messages.push(message);
                         // don't execute ordinary syscall return handling
                         // keep filling response
@@ -840,12 +1197,43 @@ impl Handlers {
                         bail!("Send to unknown address {:?}", to_addr);
                     }
                 }
+                // handle TCP send
+                Syscall::SendTo(_,
+                                File::TcpSocket(Some(to_addr)),
+                                _, data) => {
+                    let to_addr = to_addr.clone();
+                    let data_len = data.len();
+                    proc.run_until_syscall()?;
+                    let ret = proc.get_syscall_return(call)?;
+                    trace!("Process {} got syscall return {:?}", proc, ret);
+                    let channel = {
+                        match &to_addr {
+                            SocketAddress::TcpStream(name, id) => {
+                                self.tcp_channels.get(&(name.to_string(), *id)).unwrap()
+                            }
+                            _ => bail!("unexpected address")
+                        }
+                    };
+                    channel.send(data_len);
+                    self.current_tcp_message = match self.current_tcp_message.take() {
+                        None => Some((to_addr.clone(), data_len)),
+                        Some((addr, len)) => {
+                            if addr == to_addr {
+                                Some((to_addr.clone(), len + data_len))
+                            } else {
+                                self.send_tcp_message(response)?;
+                                Some((to_addr.clone(), data_len))
+                            }
+                        }
+                    };
+                    stack.push(procid.clone());
+                }
                 Syscall::Clone(_) => { // TODO: handle different clone flags differently?
                     let (tid, child) = proc.get_cloned_child()?;
                     // let parent finish syscall before starting to execute child
                     proc.run_until_syscall()?;
                     let ret = proc.get_syscall_return(call)?;
-                    trace!("Process {:?} got syscall return {:?}", proc, ret);
+                    trace!("Process {} got syscall return {:?}", proc, ret);
                     stack.push(procid.clone());
                     // Now execute child
                     trace!("New child process {:?}", child);
@@ -859,7 +1247,7 @@ impl Handlers {
                     self.address_to_name.insert(addr.clone(), procid.name.clone());
                     proc.run_until_syscall()?;
                     let ret = proc.get_syscall_return(call)?;
-                    trace!("Process {:?} got syscall return {:?}", proc, ret);
+                    trace!("Process {} got syscall return {:?}", proc, ret);
                     stack.push(procid.clone());
                 }
                 Syscall::Upcall(n) => {
@@ -872,20 +1260,22 @@ impl Handlers {
                         1 => { // annotate timeout
                             let regs = proc.get_registers()?;
                             let ty = proc.read_string(regs.rdi)?;
-                            trace!("Process {:?} setting timeout type to {}",
+                            trace!("Process {} setting timeout type to {}",
                                    proc, ty);
                             proc.stop_syscall()?;
                             proc.wake_from_stopped_call(call.clone())?;
+                            self.send_tcp_message(response)?;
                             self.new_timeout(ty);
                             stack.push(procid.clone());
                         }
                         2 => { // annotate message
                             let regs = proc.get_registers()?;
                             let ty = proc.read_string(regs.rdi)?;
-                            trace!("Process {:?} setting message type to {}",
+                            trace!("Process {} setting message type to {}",
                                    proc, ty);
                             proc.stop_syscall()?;
                             proc.wake_from_stopped_call(call.clone())?;
+                            self.send_tcp_message(response)?;
                             self.new_message(ty);
                             stack.push(procid.clone());
                         }
@@ -898,7 +1288,7 @@ impl Handlers {
                             let regs = proc.get_registers()?;
                             let path = proc.read_string(regs.rdi)?;
                             let value = regs.rsi;
-                            trace!("Process {:?} setting current.{} to {}",
+                            trace!("Process {} setting current.{} to {}",
                                    proc, path, value);
                             proc.stop_syscall()?;
                             proc.wake_from_stopped_call(call.clone())?;
@@ -922,7 +1312,7 @@ impl Handlers {
                             let regs = proc.get_registers()?;
                             let path = proc.read_string(regs.rdi)?;
                             let value = proc.read_string(regs.rsi)?;
-                            trace!("Process {:?} setting current.{} to {}",
+                            trace!("Process {} setting current.{} to {}",
                                    proc, path, value);
                             proc.stop_syscall()?;
                             proc.wake_from_stopped_call(call.clone())?;
@@ -948,7 +1338,7 @@ impl Handlers {
                 _ => {
                     proc.run_until_syscall()?;
                     let ret = proc.get_syscall_return(call)?;
-                    trace!("Process {:?} got syscall return {:?}", proc, ret);
+                    trace!("Process {} got syscall return {:?}", proc, ret);
                     stack.push(procid.clone());
                 }
             }
@@ -1013,6 +1403,7 @@ impl Handlers {
         let proc = TracedProcess::new(program.to_string())?;
         self.procs.insert(procid.clone(), proc);
         self.fill_response(procid.clone(), response)?;
+        self.send_tcp_message(response)?;
         self.get_state(procid.clone().parent_process(), response)?;
         Ok(())
     }
@@ -1021,21 +1412,149 @@ impl Handlers {
                           -> Result<(), Error> {
         let node = message.to;
         let raw = message.raw;
-        let wire_message : WireMessage = deserialize(&raw)?;
-        if let Some((procid, _call)) = self.message_waiting_procs.get(&wire_message.to) {
+        let wire_message : WireMessage = serde_json::from_value(raw)?;
+        // first, deliver a TCP message if necessary
+        if let MessageData::TcpMessage(size) = &wire_message.data {
+            trace!("Got TCP message of size {}", size);
+            let channel: &mut TcpChannel = {
+                match &wire_message.to {
+                    SocketAddress::TcpStream(name, id) => {
+                        self.tcp_channels.get_mut(&(name.to_string(), *id)).unwrap()
+                    }
+                    _ => bail!("unexpected address")
+                }
+            };
+            let mut buf = vec![0; *size];
+            trace!("Reading from socket");
+            channel.remote.as_ref().unwrap().read_exact(&mut buf)?;
+            trace!("Writing to socket");
+            channel.local.as_ref().unwrap().write_all(&buf)?;
+            *channel.delivered.borrow_mut() += size;
+        }
+        if let Some((procid, call)) = self.message_waiting_procs.get(&wire_message.to) {
             if procid.name != node {
                 bail!("Message send to mismatched node ({} vs {})", procid.name, node);
             }
             // for now assume call is a recvfrom()
             let proc = self.procs.get_mut(procid).expect("Bad procid");
-            proc.recvfrom_return(wire_message.from, wire_message.data)?;
+            match wire_message.data {
+                MessageData::Data(data) => {
+                    proc.recvfrom_return(wire_message.from, data)?;
+                }
+                MessageData::TcpConnect(remote_counter) => {
+                    if let Syscall::Accept(_, _) = call {
+                        if let SocketAddress::IPV4(port) = wire_message.to {
+                            // start accepting, but don't wait for syscall to return
+                            let (addr_ptr, addr_len) = proc.accept_continue()?;
+                            // this call should return immediately, since proc is accepting
+                            let local = TcpStream::connect(("localhost", port)).unwrap();
+                            let counter = proc.next_counter();
+                            let channel = {
+                                let remote_channel =
+                                    self.tcp_channels.get_mut(&(message.from.clone(),
+                                                                remote_counter)).unwrap();
+                                remote_channel.remote = Some(local.try_clone().unwrap());
+                                remote_channel.remote_addr = Some(SocketAddress::TcpStream(procid.name.clone(), counter));
+                                remote_channel.reverse(SocketAddress::TcpStream(message.from.clone(), remote_counter))
+                            };
+                            self.tcp_channels.insert((procid.name.clone(), counter), channel);
+
+                            // send acknowledgment message
+                            let local_addr = SocketAddress::TcpStream(procid.name.clone(), counter);
+                            let raw = WireMessage {from: Some(local_addr.clone()),
+                                                   to: SocketAddress::TcpStream(message.from.clone(),
+                                                                                remote_counter),
+                                                   data: MessageData::TcpAck(procid.name.clone())};
+                            let mut response_message = data::Message::new();
+                            response_message.from = procid.name.clone();
+                            response_message.to = message.from.clone();
+                            response_message.ty = "Tcp-Ack".to_string();
+                            response_message.raw = serde_json::to_value(&raw).unwrap();
+                            response.messages.push(response_message);
+                            self.address_to_name.insert(local_addr.clone(), message.from.clone());
+                            proc.accept_return(addr_ptr, addr_len, wire_message.from, local_addr)?;
+                        } else {
+                            bail!("Unsupported address type");
+                        }
+                    } else {
+                        bail!("Connect to socket that isn't accept()-ing");
+                    }
+                }
+                MessageData::TcpAck(remote_name) => {
+                    if let Syscall::Connect(fd, _, _) =  call {
+                        match (wire_message.to, wire_message.from) {
+                            (SocketAddress::TcpStream(local_name, local_stream_id),
+                             Some(SocketAddress::TcpStream(remote_name, remote_stream_id)))
+                                => {
+                                    let local_channel_id = (local_name,
+                                                            local_stream_id);
+                                    let remote_channel_id = (remote_name,
+                                                             remote_stream_id);
+                                    let listener = {
+                                        let local_channel =
+                                            self.tcp_channels.get(&local_channel_id).unwrap();
+                                        local_channel.listener.as_ref().unwrap().try_clone().unwrap()
+                                    };
+                                    //let remote_stream = self.tcp_channels.get_mut(&(remote_name, remote_stream_id)).unwrap();
+                                    // the connecting process should connect to our listener
+                                    //local_stream.listener = remote_stream.listener.clone();
+                                    let port = listener.local_addr().unwrap().port();
+                                    // have the connecting process connect to the listener
+                                    proc.connect_continue(SocketAddress::IPV4(port))?;
+                                    // this accept() should return immediately
+                                    trace!("Calling accept() on listener; port is {}", port);
+                                    let stream: Rc<TcpStream> = listener.accept()?.0.into();
+                                    // overwrite both local and remote streams
+                                    // now that conn is established
+                                    {
+                                        let local_channel = self.tcp_channels.get_mut(
+                                            &local_channel_id).unwrap();
+                                        local_channel.local = Some(stream.try_clone().unwrap());
+                                    }
+                                    {
+                                        let remote_channel = self.tcp_channels.get_mut(
+                                            &remote_channel_id).unwrap();
+                                        remote_channel.remote = Some(stream.try_clone().unwrap());
+                                    }
+                                    proc.continue_return(*fd,
+                                                         SocketAddress::TcpStream(procid.name.clone(),
+                                                                                  local_stream_id))?;
+                                    
+                                }
+                            _ => bail!("Bad Tcp-Ack message")
+                        }
+                    } else {
+                        bail!("Ack to socket that isn't connect()-ing");
+                    }
+                }
+                MessageData::TcpMessage(len) => {
+                    // we've got a TCP message and a waiting receiver. We
+                    // already delivered the message.
+                    let to_addr = wire_message.to.clone();
+                    let channel = {
+                        match &to_addr {
+                            SocketAddress::TcpStream(name, id) => {
+                                self.tcp_channels.get(&(name.to_string(), *id)).unwrap()
+                            }
+                            _ => bail!("unexpected address")
+                        }
+                    };
+                    proc.run_until_syscall()?;
+                    let ret = proc.get_syscall_return(call.clone())?;
+                    trace!("Process {} got syscall return {:?}", proc, ret);
+                    if let SyscallReturn::Success(value) = ret {
+                        *channel.delivered.borrow_mut() -= value as usize;
+                    }
+                }
+            }
             let procid = procid.clone();
             self.fill_response(procid.clone(), response)?;
-            self.get_state(procid.parent_process(), response)?;
-            Ok(())
+            self.send_tcp_message(response)?;
+            self.get_state(procid.clone().parent_process(), response)?;
         } else {
-            bail!("Message to unknown recipient");
+            trace!("Message to unknown recipient");
         }
+        Ok(())
     }
 
     pub fn handle_timeout(&mut self, timeout: data::Timeout,
@@ -1060,6 +1579,7 @@ impl Handlers {
             });
             let procid = procid.clone();
             self.fill_response(procid.clone(), response)?;
+            self.send_tcp_message(response)?;
             self.get_state(procid.parent_process(), response)?;
             Ok(())
         } else {
