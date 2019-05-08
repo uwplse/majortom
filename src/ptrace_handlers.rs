@@ -1325,11 +1325,25 @@ impl Handlers {
                     trace!("Futex wake woke two processes");
                     stack.push(procid.clone());
                     // let's wake a process
-                    if let Some(waiters) = self.futexes.get_mut(&futex) {
-                        if let Some(first_waiter_id) = waiters.pop_front() {
-                            // need to wake this process
-                            stack.push(first_waiter_id);
-                        }
+                    let waiter_id =
+                        if let Some(waiters) = self.futexes.get_mut(&futex) {
+                            if let Some(first_waiter_id) = waiters.pop_front() {
+                                // need to wake this process
+                                stack.push(first_waiter_id);
+                            }
+                            // if there was more than one waiter, need to make sure
+                            // the next one actually starts waiting
+                            match waiters.front() {
+                                Some(waiter_id) => Some(waiter_id.clone()),
+                                None => None
+                            }
+                        } else { None };
+                    if let Some(waiter_id) = waiter_id {
+                        // let's wake up this waiter
+                        trace!("Letting {:?} wait on futex", waiter_id);
+                        let waiter = self.procs.get_mut(&waiter_id).expect(
+                            &format!("Bad process identifier {:?}", waiter_id));
+                        waiter.run_until_syscall()?;
                     }
                 }
                 
