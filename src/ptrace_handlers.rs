@@ -597,14 +597,10 @@ impl TracedProcess {
 
     unsafe fn write<T>(&self, addr: u64, t: T) -> Result<(), Error> where T: Copy {
         trace!("size_of(T) is {:?} bytes", size_of::<T>());
-        unsafe {
-            let p: *const T = &t;     // the same operator is used as with references
-            let p: *const u8 = p as *const u8;  // convert between pointer types
-            let s: &[u8] = unsafe { 
-                slice::from_raw_parts(p, size_of::<T>())
-            };
-            self.write_data(addr, s.into())?;
-        }
+        let p: *const T = &t;     // the same operator is used as with references
+        let p: *const u8 = p as *const u8;  // convert between pointer types
+        let s: &[u8] = slice::from_raw_parts(p, size_of::<T>())
+        self.write_data(addr, s.into())?;
         Ok(())
     }
     
@@ -1320,7 +1316,7 @@ impl Handlers {
                                                       (procid.clone(), call.clone()));
                     // we're blocking, so we're done here
                 }
-                Syscall::RecvFrom(_, File::TcpSocket(Some(to_addr)), size) => {
+                Syscall::RecvFrom(_, File::TcpSocket(Some(to_addr)), _size) => {
                     let to_addr = to_addr.clone();
                     let channel = {
                         match &to_addr {
@@ -1344,7 +1340,7 @@ impl Handlers {
                                                           (procid.clone(), call.clone()));
                     }
                 }
-                Syscall::Connect(fd, File::TcpSocket(from_addr), to_addr) => {
+                Syscall::Connect(_fd, File::TcpSocket(from_addr), to_addr) => {
                     // don't stop the process
                     if let Some(to) = self.address_to_name.get(&to_addr) {
                         let counter = proc.next_counter();
@@ -1749,7 +1745,7 @@ impl Handlers {
                         bail!("Connect to socket that isn't accept()-ing");
                     }
                 }
-                MessageData::TcpAck(remote_name) => {
+                MessageData::TcpAck(_remote_name) => {
                     if let Syscall::Connect(fd, _, _) =  call {
                         match (wire_message.to, wire_message.from) {
                             (SocketAddress::TcpStream(local_name, local_stream_id),
@@ -1796,7 +1792,7 @@ impl Handlers {
                         bail!("Ack to socket that isn't connect()-ing");
                     }
                 }
-                MessageData::TcpMessage(len) => {
+                MessageData::TcpMessage(_len) => {
                     // we've got a TCP message and a waiting receiver. We
                     // already delivered the message.
                     let to_addr = wire_message.to.clone();
