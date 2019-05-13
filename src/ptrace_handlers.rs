@@ -6,6 +6,7 @@ use nix::sys::ptrace;
 use nix::sys::wait::{waitpid, WaitStatus, WaitPidFlag};
 use nix::sys::socket::{AddressFamily, SockProtocol, SockType, sockaddr_storage, sockaddr_in};
 use nix::sched::CloneFlags;
+use nix::sys::epoll;
 use libc::user_regs_struct;
 use std::mem::size_of;
 use std::slice;
@@ -26,6 +27,7 @@ use crate::data;
 enum File {
     TcpSocket(Option<SocketAddress>),
     UDPSocket(Option<SocketAddress>),
+    EpollFd(Vec<(i32, epoll::EpollFlags)>),
     ReadFile(String),
     WriteFile(String),
     Special
@@ -318,7 +320,7 @@ enum Syscall {
     // things, so we have some fake Futex calls to disambiguate.
     FutexTest,
     FutexWait(u64),
-    FutexWake(u64),
+    FutexWake(u64, usize),
     GetRLimit,
     Clone(CloneFlags),
     SigAltStack,
@@ -327,6 +329,20 @@ enum Syscall {
     LSeek,
     MkDir(String),
     SetSockOpt(i32, i32, i32),
+    Uname,
+    GetTid,
+    SysInfo,
+    ReadLink,
+    SetITimer,
+    GetTime,
+    IoCtl,
+    FnCtl,
+    Unlink(String),
+    Symlink(String, String),
+    MSync,
+    MInCore,
+    SchedYield,
+    EpollCreate,
     Upcall(usize),
 }
 
@@ -402,14 +418,20 @@ impl TracedProcess {
     }
 
     fn wait_status(&self) -> Result<WaitStatus, Error> {
+        use nix::sys::signal::Signal;
         loop {
             let status = waitpid(Pid::from_raw(-1), Some(WaitPidFlag::__WALL))?;
-            if let WaitStatus::Stopped(pid, nix::sys::signal::Signal::SIGWINCH) = status {
-                trace!("Got SIGWINCH, ignoring it and continuing");
-                // this is a hack!
-                ptrace::syscall(pid)?;
-            } else {
-                return Ok(status);
+            match status {
+                WaitStatus::Stopped(pid, signal) if
+                    (signal == Signal::SIGWINCH ||
+                     signal == Signal::SIGPROF) => {
+                        trace!("Got {}, ignoring it and continuing", signal);
+                        // this is a hack!
+                        ptrace::syscall(pid)?;
+                    }
+                _ => {
+                    return Ok(status);
+                }
             }
         }
     }
@@ -677,11 +699,25 @@ impl TracedProcess {
             // TODO: figure out if I actually need to deal with signals
             13 => Ok(Syscall::SigAction),
             14 => Ok(Syscall::SigProcMask),
+            16 => Ok(Syscall::IoCtl),
             21 => { // access()
                 let s = self.read_string(regs.rdi)?;
                 Ok(Syscall::Access(s))
             },
+            24 => Ok(Syscall::SchedYield),
+            26 => Ok(Syscall::MSync),
+            27 => Ok(Syscall::MInCore),
             35 => Ok(Syscall::NanoSleep),
+            38 => { //setitimer
+                // Currently we only allow programs to set the
+                // profiling timer, which we ignore.
+                let which = regs.rdi as i32;
+                if which == libc::ITIMER_PROF {
+                    Ok(Syscall::SetITimer)
+                } else {
+                    bail!("Unsupported ITimer {}", which);
+                }
+            }
             41 => { // socket()
                 let socket_family = regs.rdi as i32;
                 let socket_type = regs.rsi as i32;
@@ -770,13 +806,37 @@ impl TracedProcess {
                     .ok_or(format_err!("Invalid clone() flags"))?;
                 Ok(Syscall::Clone(flags))
             },
+            63 => { // uname()
+                Ok(Syscall::Uname)
+            }
+            72 => Ok(Syscall::FnCtl),
             83 => { // mkdir()
                 let path = self.read_string(regs.rdi)?;
                 Ok(Syscall::MkDir(path))
             }
+            87 => { // unlink
+                let path = self.read_string(regs.rdi)?;
+                self.snapshot.borrow_mut().snapshot_file(path.clone())?;
+                Ok(Syscall::Unlink(path))
+            }
+            88 => { // symlink
+                let src_path = self.read_string(regs.rdi)?;
+                let dst_path = self.read_string(regs.rsi)?;
+                let mut snapshot = self.snapshot.borrow_mut();
+                snapshot.snapshot_file(src_path.clone())?;
+                snapshot.snapshot_file(dst_path.clone())?;
+                Ok(Syscall::Symlink(src_path, dst_path))
+            }
+            89 => { // readlink()
+                Ok(Syscall::ReadLink)
+            }
             97 => Ok(Syscall::GetRLimit),
+            99 => { // sysinfo()
+                Ok(Syscall::SysInfo)
+            }
             131 => Ok(Syscall::SigAltStack),
             158 => Ok(Syscall::ArchPrctl),
+            186 => Ok(Syscall::GetTid),
             // Futexes!
             202 => {
                 let word = regs.rdi as u64;
@@ -786,12 +846,13 @@ impl TracedProcess {
                 let futex = Futex::from_i32(op);
                 if let Some(futex) = futex {
                     match futex {
+                        // TODO: worry about private futexes?
                         Futex {cmd: FutexCmd::WaitBitset,
                                private: true,
                                realtime: true} =>
                             Ok(Syscall::FutexTest),
                         Futex {cmd: FutexCmd::Wait,
-                               private: true,
+                               private: _,
                                realtime: _} => {
                             if time_ptr != 0 {
                                 bail!("Timed futex waits not yet supported");
@@ -799,9 +860,10 @@ impl TracedProcess {
                             Ok(Syscall::FutexWait(word))
                         }
                         Futex {cmd: FutexCmd::Wake,
-                               private: true,
-                               realtime: _} =>
-                            Ok(Syscall::FutexWake(word)),
+                               private: _,
+                               realtime: _} => {
+                            Ok(Syscall::FutexWake(word, val as usize))
+                        }
                         _ => bail!("Bad futex op {:?}", futex)
                     }
                 } else {
@@ -810,8 +872,15 @@ impl TracedProcess {
             }
             203 => Ok(Syscall::SchedSetAffinity),
             204 => Ok(Syscall::SchedGetAffinity),
+            228 => { // clock_gettime
+                // For now, we're just going to let these go through.
+                Ok(Syscall::GetTime)
+            }
             218 => Ok(Syscall::SetTidAddress),
             273 => Ok(Syscall::SetRobustList),
+            291 => { // epoll_create1
+                Ok(Syscall::EpollCreate) // ignore flags for now
+            }
             // upcalls from application
             x if x >= 5000 => Ok(Syscall::Upcall((x - 5000) as usize)),
             _ => bail!("Unsupported system call {} called by process {:?}",
@@ -849,6 +918,16 @@ impl TracedProcess {
                 trace!("Removing file {} from proc {:?}", fd, self);
                 self.files.borrow_mut().remove(&fd);
             }
+            (Syscall::Unlink(path), SyscallReturn::Success(_)) => {
+                trace!("Marking {} for restoration (unlinked)", path);
+                self.snapshot.borrow_mut().mark_for_restoration(path.clone());
+            }
+            (Syscall::Symlink(src_path, dst_path), SyscallReturn::Success(_)) => {
+                trace!("Marking {} and {} for restoration (symlink)", src_path, dst_path);
+                let mut snapshot = self.snapshot.borrow_mut();
+                snapshot.mark_for_restoration(src_path.clone());
+                snapshot.mark_for_restoration(dst_path.clone());
+            }
             (Syscall::UDPSocket, SyscallReturn::Success(fd)) => {
                 let fd = fd as i32;
                 let file = File::UDPSocket(None);
@@ -881,6 +960,11 @@ impl TracedProcess {
                 //         _ => bail!("bind() on bad file {:?}", sock)
                 //     };
                 //     self.files.borrow_mut().insert(fd, new_sock);
+            }
+            (Syscall::EpollCreate, SyscallReturn::Success(fd)) => {
+                let fd = fd as i32;
+                let file = File::EpollFd(Vec::new());
+                self.files.borrow_mut().insert(fd, file);
             }
             (Syscall::MkDir(path), SyscallReturn::Success(_)) => {
                 // we successfully made a directory, so we're going to want to
@@ -1318,32 +1402,48 @@ impl Handlers {
                     waiters.push_back(procid.clone());
                     // Don't wait on the next call here--if we did, we would block forever
                 }
-                Syscall::FutexWake(futex) => {
+                Syscall::FutexWake(futex, wakes) => {
                     let futex = *futex;
-                    proc.run_until_syscall()?;
-                    proc.wait_on_futex_wake()?;
-                    trace!("Futex wake woke two processes");
-                    stack.push(procid.clone());
-                    // let's wake a process
-                    let waiter_id =
-                        if let Some(waiters) = self.futexes.get_mut(&futex) {
-                            if let Some(first_waiter_id) = waiters.pop_front() {
-                                // need to wake this process
-                                stack.push(first_waiter_id);
+                    let n_waiters = {
+                        if let Some(waiters) = self.futexes.get(&futex) {
+                            waiters.len()
+                        } else { 0 }
+                    };
+                    match (wakes, n_waiters) {
+                        (_, 0) => {
+                            proc.run_until_syscall()?;
+                            let ret = proc.get_syscall_return(call)?;
+                            trace!("Process {} got syscall return {:?}", proc, ret);
+                            stack.push(procid.clone());
+                        }
+                        (1, _) => {
+                            proc.run_until_syscall()?;
+                            proc.wait_on_futex_wake()?;
+                            trace!("Futex wake woke two processes");
+                            stack.push(procid.clone());
+                            // let's wake a process
+                            let waiter_id =
+                                if let Some(waiters) = self.futexes.get_mut(&futex) {
+                                    if let Some(first_waiter_id) = waiters.pop_front() {
+                                        // need to wake this process
+                                        stack.push(first_waiter_id);
+                                    }
+                                    // if there was more than one waiter, need to make sure
+                                    // the next one actually starts waiting
+                                    match waiters.front() {
+                                        Some(waiter_id) => Some(waiter_id.clone()),
+                                        None => None
+                                    }
+                                } else { None };
+                            if let Some(waiter_id) = waiter_id {
+                                // let's wake up this waiter
+                                trace!("Letting {:?} wait on futex", waiter_id);
+                                let waiter = self.procs.get_mut(&waiter_id).expect(
+                                    &format!("Bad process identifier {:?}", waiter_id));
+                                waiter.run_until_syscall()?;
                             }
-                            // if there was more than one waiter, need to make sure
-                            // the next one actually starts waiting
-                            match waiters.front() {
-                                Some(waiter_id) => Some(waiter_id.clone()),
-                                None => None
-                            }
-                        } else { None };
-                    if let Some(waiter_id) = waiter_id {
-                        // let's wake up this waiter
-                        trace!("Letting {:?} wait on futex", waiter_id);
-                        let waiter = self.procs.get_mut(&waiter_id).expect(
-                            &format!("Bad process identifier {:?}", waiter_id));
-                        waiter.run_until_syscall()?;
+                        }
+                        _ => bail!("Waking more than one process is currently not supported")
                     }
                 }
                 
