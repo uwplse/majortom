@@ -6,8 +6,8 @@ use nix::sys::ptrace;
 use nix::sys::wait::{waitpid, WaitStatus, WaitPidFlag};
 use nix::sys::socket::{AddressFamily, SockProtocol, SockType, sockaddr_storage, sockaddr_in};
 use nix::sched::CloneFlags;
-use nix::sys::epoll;
-use libc::user_regs_struct;
+use nix::sys::epoll::{EpollOp, EpollFlags};
+use libc::{user_regs_struct, epoll_event};
 use std::mem::size_of;
 use std::slice;
 use failure::{ResultExt, Error};
@@ -27,7 +27,9 @@ use crate::data;
 enum File {
     TcpSocket(Option<SocketAddress>),
     UDPSocket(Option<SocketAddress>),
-    EpollFd(Vec<(i32, epoll::EpollFlags)>),
+    EpollFd(Vec<(i32, EpollFlags)>),
+    TimerFd(bool, bool), // armed, repeating
+    SignalFd, // armed, repeating
     ReadFile(String),
     WriteFile(String),
     Special
@@ -342,7 +344,11 @@ enum Syscall {
     MSync,
     MInCore,
     SchedYield,
+    TimerFdCreate,
+    SignalFd,
     EpollCreate,
+    // EpollFlags must be set if op is add or mod
+    EpollCtl(i32, EpollOp, i32, Option<EpollFlags>),
     Upcall(usize),
 }
 
@@ -877,7 +883,38 @@ impl TracedProcess {
                 Ok(Syscall::GetTime)
             }
             218 => Ok(Syscall::SetTidAddress),
+            233 => { // epoll_ctl
+                let epfd = regs.rdi as i32;
+                let op: EpollOp = match regs.rsi as i32 {
+                    x if x == EpollOp::EpollCtlAdd as i32 => EpollOp::EpollCtlAdd,
+                    x if x == EpollOp::EpollCtlDel as i32 => EpollOp::EpollCtlDel,
+                    x if x == EpollOp::EpollCtlMod as i32 => EpollOp::EpollCtlMod,
+                    _ => bail!("Bad epoll op")
+                };
+                let fd = regs.rdx as i32;
+                let flags = {
+                    if regs.r10 == 0 {
+                        if op == EpollOp::EpollCtlDel {
+                            None
+                        } else {
+                            bail!("Epoll called with null events");
+                        }
+                    } else {
+                        let event_struct: epoll_event = unsafe {
+                            self.read(regs.r10)?
+                        };
+                        Some(EpollFlags::from_bits(event_struct.events as i32).unwrap())
+                    }
+                };
+                Ok(Syscall::EpollCtl(epfd, op, fd, flags))
+            }
             273 => Ok(Syscall::SetRobustList),
+            283 => { // timerfd_create
+                Ok(Syscall::TimerFdCreate)
+            }
+            289 => { // signalfd
+                Ok(Syscall::SignalFd)
+            }
             291 => { // epoll_create1
                 Ok(Syscall::EpollCreate) // ignore flags for now
             }
@@ -961,10 +998,45 @@ impl TracedProcess {
                 //     };
                 //     self.files.borrow_mut().insert(fd, new_sock);
             }
+            (Syscall::TimerFdCreate, SyscallReturn::Success(fd)) => {
+                let fd = fd as i32;
+                let file = File::TimerFd(false, false);
+                self.files.borrow_mut().insert(fd, file);
+            }
+            (Syscall::SignalFd, SyscallReturn::Success(fd)) => {
+                let fd = fd as i32;
+                let file = File::SignalFd;
+                self.files.borrow_mut().insert(fd, file);
+            }
             (Syscall::EpollCreate, SyscallReturn::Success(fd)) => {
                 let fd = fd as i32;
                 let file = File::EpollFd(Vec::new());
                 self.files.borrow_mut().insert(fd, file);
+            }
+            (Syscall::EpollCtl(epfd, op, fd, flags), SyscallReturn::Success(_)) => {
+                use EpollOp::*;
+                match self.files.borrow_mut().get_mut(&epfd) {
+                    Some(File::EpollFd(fds)) => {
+                        match op {
+                            EpollCtlAdd => {
+                                fds.push((fd, flags.unwrap()))
+                            }
+                            EpollCtlMod => {
+                                for entry in fds.iter_mut() {
+                                    if entry.0 == fd {
+                                        entry.1 = flags.unwrap()
+                                    }
+                                }
+                            }
+                            EpollCtlDel => {
+                                let index = fds.iter().position(|e| e.0 == fd).unwrap();
+                                fds.remove(index);
+
+                            }
+                        }
+                    }
+                    file => bail!("epoll_ctl on bad file {:?}", file)
+                }
             }
             (Syscall::MkDir(path), SyscallReturn::Success(_)) => {
                 // we successfully made a directory, so we're going to want to
