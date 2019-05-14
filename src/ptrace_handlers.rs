@@ -4,7 +4,7 @@ use std::net::{TcpListener, TcpStream};
 use nix::unistd::{Pid, fork, ForkResult,execv};
 use nix::sys::ptrace;
 use nix::sys::wait::{waitpid, WaitStatus, WaitPidFlag};
-use nix::sys::socket::{AddressFamily, SockProtocol, SockType, sockaddr_storage, sockaddr_in};
+use nix::sys::socket::{AddressFamily, SockProtocol, SockType, sockaddr_storage, sockaddr_in, SockFlag};
 use nix::sched::CloneFlags;
 use nix::sys::epoll::{EpollOp, EpollFlags};
 use libc::{user_regs_struct, epoll_event};
@@ -23,7 +23,7 @@ base64_serde_type!(Base64Standard, base64::STANDARD);
 
 use crate::data;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 enum File {
     TcpSocket(Option<SocketAddress>),
     UDPSocket(Option<SocketAddress>),
@@ -278,7 +278,8 @@ pub struct Handlers {
     current_state: Option<serde_json::Value>,
     annotate_state_procs: HashMap<TracedProcessIdentifier, TracedProcessIdentifier>,
     current_tcp_message: Option<(SocketAddress, usize)>,
-    futexes: HashMap<u64, VecDeque<TracedProcessIdentifier>>
+    // futex -> (current waiter (if any), other waiters (if any))
+    futexes: HashMap<u64, (Option<TracedProcessIdentifier>, VecDeque<TracedProcessIdentifier>)>
 }
 
 
@@ -298,6 +299,7 @@ enum Syscall {
     Access(String),
     // filename, flags
     Open(String, i32),
+    Dup(i32),
     Stat,
     Fstat(i32, File),
     MMap(i32, Option<File>),
@@ -306,6 +308,8 @@ enum Syscall {
     Read(i32, File),
     UDPSocket,
     TcpSocket,
+    GetAddrInfoSocket,
+    SpecialOp,
     Bind(i32, SocketAddress),
     Listen(i32, i32),
     Connect(i32, File, SocketAddress),
@@ -332,6 +336,8 @@ enum Syscall {
     MkDir(String),
     SetSockOpt(i32, i32, i32),
     Uname,
+    GetSockName,
+    GetPeerName,
     GetTid,
     SysInfo,
     ReadLink,
@@ -341,8 +347,11 @@ enum Syscall {
     FnCtl,
     Unlink(String),
     Symlink(String, String),
+    Fsync,
+    FLock,
     MSync,
     MInCore,
+    GetDents,
     SchedYield,
     TimerFdCreate,
     SignalFd,
@@ -352,7 +361,7 @@ enum Syscall {
     Upcall(usize),
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum SyscallReturn {
     Success(i64), Failure(i64)
 }
@@ -464,11 +473,14 @@ impl TracedProcess {
         // being awakened. We're not sure here what the other pid is, so we're
         // just going to wait *twice*, make sure both statuses are
         // PtraceSyscall, and call it a day.
-        let status = self.wait_status()?;
-        if let WaitStatus::PtraceSyscall(_) = status {
-            Ok(())
-        } else {
-            bail!("Unexpected WaitStatus {:?}", status)
+        use WaitStatus::*;
+        let status1 = self.wait_status()?;
+        let status2 = self.wait_status()?;
+        trace!("Waiting on futex wake, got results {:?} and {:?}", status1, status2);
+        
+        match (status1, status2) {
+            (PtraceSyscall(_), PtraceSyscall(_)) => Ok(()),
+            _ => bail!("Unexpected WaitStatuses {:?} {:?}", status1, status2)
         }
     }
 
@@ -599,7 +611,7 @@ impl TracedProcess {
         trace!("size_of(T) is {:?} bytes", size_of::<T>());
         let p: *const T = &t;     // the same operator is used as with references
         let p: *const u8 = p as *const u8;  // convert between pointer types
-        let s: &[u8] = slice::from_raw_parts(p, size_of::<T>())
+        let s: &[u8] = slice::from_raw_parts(p, size_of::<T>());
         self.write_data(addr, s.into())?;
         Ok(())
     }
@@ -702,6 +714,15 @@ impl TracedProcess {
             13 => Ok(Syscall::SigAction),
             14 => Ok(Syscall::SigProcMask),
             16 => Ok(Syscall::IoCtl),
+            20 => { //writev()
+                let fd = regs.rdi as i32;
+                if let Some(file) = self.files.borrow().get(&fd) {
+                    Ok(Syscall::Write(fd, file.clone()))
+                } else {
+                    bail!("writev() called on unknown file")
+                }
+            }
+            
             21 => { // access()
                 let s = self.read_string(regs.rdi)?;
                 Ok(Syscall::Access(s))
@@ -709,6 +730,10 @@ impl TracedProcess {
             24 => Ok(Syscall::SchedYield),
             26 => Ok(Syscall::MSync),
             27 => Ok(Syscall::MInCore),
+            32 => { // dup()
+                let fd = regs.rdi as i32;
+                Ok(Syscall::Dup(fd))
+            }
             35 => Ok(Syscall::NanoSleep),
             38 => { //setitimer
                 // Currently we only allow programs to set the
@@ -722,22 +747,37 @@ impl TracedProcess {
             }
             41 => { // socket()
                 let socket_family = regs.rdi as i32;
-                let socket_type = regs.rsi as i32;
+                let socket_type_and_flags = regs.rsi as i32;
+                let socket_type = socket_type_and_flags & !(SockFlag::all().bits());
                 let socket_protocol = regs.rdx as i32;
                 // ensure this is a supported socket type
                 if (socket_family == AddressFamily::Inet as i32 ||
                     socket_family == AddressFamily::Inet6 as i32) &&
-                    socket_type == SockType::Datagram as i32 &&
-                    socket_protocol == SockProtocol::Udp as i32 {
-                    Ok(Syscall::UDPSocket)
+                    (socket_type == SockType::Datagram as i32 ||
+                     socket_protocol == SockProtocol::Udp as i32) {
+                        Ok(Syscall::UDPSocket)
                     }
                 else if (socket_family == AddressFamily::Inet as i32 ||
                     socket_family == AddressFamily::Inet6 as i32) &&
-                    socket_type == SockType::Stream as i32 &&
-                    socket_protocol == SockProtocol::Tcp as i32 {
-                    Ok(Syscall::TcpSocket)
+                    (socket_type == SockType::Stream as i32 ||
+                     socket_protocol == SockProtocol::Tcp as i32) {
+                        Ok(Syscall::TcpSocket)
                     }
+                // special-case wacky getaddrinfo() sockets
+                else if (socket_family == 16 &&
+                         socket_type == 3 &&
+                         socket_protocol == 0) ||
+                    (socket_family == 1 &&
+                         socket_type == 1 &&
+                         socket_protocol == 0)
+                {
+                    Ok(Syscall::GetAddrInfoSocket)
+                }
                 else {
+                    trace!("AF_INET={}, AF_INET6={}, SOCK_STREAM={}",
+                           AddressFamily::Inet as i32,
+                           AddressFamily::Inet6 as i32,
+                           SockType::Stream as i32);
                     bail!("Unsupported socket({}, {}, {})",
                            socket_family, socket_type, socket_protocol);
                 }
@@ -750,6 +790,7 @@ impl TracedProcess {
                             let socket_address = self.read_socket_address(regs.rsi, regs.rdx as usize)?;
                             Ok(Syscall::Connect(fd, sock.clone(), socket_address))
                         }
+                        File::Special => Ok(Syscall::SpecialOp),
                         _ => bail!("connect() called on bad file {:?}", sock)
                     }
                 } else {
@@ -767,13 +808,17 @@ impl TracedProcess {
             44 => { // sendto()
                 let fd = regs.rdi as i32;
                 if let Some(sock) = self.files.borrow().get(&fd) {
-                    let socket_address = if regs.r8 != 0 {
-                        Some(self.read_socket_address(regs.r8, regs.r9 as usize)?)
+                    if sock == &File::Special {
+                        Ok(Syscall::SpecialOp)
                     } else {
-                        None
-                    };
-                    let data = self.read_data(regs.rsi, regs.rdx as usize)?;
-                    Ok(Syscall::SendTo(fd, sock.clone(), socket_address, data))
+                        let socket_address = if regs.r8 != 0 {
+                            Some(self.read_socket_address(regs.r8, regs.r9 as usize)?)
+                        } else {
+                            None
+                        };
+                        let data = self.read_data(regs.rsi, regs.rdx as usize)?;
+                        Ok(Syscall::SendTo(fd, sock.clone(), socket_address, data))
+                    }
                 } else {
                     bail!("sendto() called on unknown file")
                 }
@@ -787,16 +832,34 @@ impl TracedProcess {
                     bail!("recvfrom() called on unknown file")
                 }
             }
+            47 => { // recvmsg (only supported on special socks for now)
+                let fd = regs.rdi as i32;
+                if self.files.borrow().get(&fd) == Some(&File::Special) {
+                    Ok(Syscall::SpecialOp)
+                } else {
+                    bail!("recvmsg not yet supported");
+                }
+            }
             49 => { // bind()
                 let fd = regs.rdi as i32;
-                let socket_address = self.read_socket_address(regs.rsi, regs.rdx as usize)?;
-                Ok(Syscall::Bind(fd, socket_address))
+                if self.files.borrow().get(&fd) == Some(&File::Special) {
+                    Ok(Syscall::SpecialOp)
+                } else {
+                    let socket_address = self.read_socket_address(regs.rsi, regs.rdx as usize)?;
+                    Ok(Syscall::Bind(fd, socket_address))
+                }
             },
             50 => { // listen()
                 let fd = regs.rdi as i32;
                 let backlog = regs.rsi as i32;
                 Ok(Syscall::Listen(fd, backlog))
             },
+            51 => { // getsockname()
+                Ok(Syscall::GetSockName)
+            }
+            52 => { // getpeername()
+                Ok(Syscall::GetPeerName)
+            }
             54 => { // setsockopt()
                 let fd = regs.rdi as i32;
                 let level = regs.rsi as i32;
@@ -812,6 +875,9 @@ impl TracedProcess {
                 Ok(Syscall::Uname)
             }
             72 => Ok(Syscall::FnCtl),
+            73 => Ok(Syscall::FLock),
+            74 => Ok(Syscall::Fsync),
+            78 => Ok(Syscall::GetDents),
             83 => { // mkdir()
                 let path = self.read_string(regs.rdi)?;
                 Ok(Syscall::MkDir(path))
@@ -904,9 +970,53 @@ impl TracedProcess {
                 };
                 Ok(Syscall::EpollCtl(epfd, op, fd, flags))
             }
+            257 => { // openat()
+                let fd = regs.rdi as i32;
+                // TODO: factor out this relative path logic (used in mkdirat() too)
+                let path = {
+                    let relative = self.read_string(regs.rsi)?;
+                    let mut path = std::path::PathBuf::new();
+                    match self.files.borrow().get(&fd) {
+                        Some(File::ReadFile(dirpath)) => path.push(dirpath.clone()),
+                        file => bail!("mkdirat called on bad file {:?}", file)
+                    };
+                    path.push(relative);
+                    path.to_str().unwrap().to_string()
+                };
+                let flags = regs.rdx as i32;
+                if !is_read_only(flags) {
+                    // snapshot file here: even though the open might not
+                    // succeed, if it does it could create or truncate the file
+                    self.snapshot.borrow_mut().snapshot_file(path.clone())?;
+                }
+                Ok(Syscall::Open(path, flags))
+
+            }
+            258 => { // mkdirat()
+                let fd = regs.rdi as i32;
+                let path = {
+                    let relative = self.read_string(regs.rsi)?;
+                    let mut path = std::path::PathBuf::new();
+                    match self.files.borrow().get(&fd) {
+                        Some(File::ReadFile(dirpath)) => path.push(dirpath.clone()),
+                        file => bail!("mkdirat called on bad file {:?}", file)
+                    };
+                    path.push(relative);
+                    path.to_str().unwrap().to_string()
+                };
+                Ok(Syscall::MkDir(path))
+            }
             273 => Ok(Syscall::SetRobustList),
             283 => { // timerfd_create
                 Ok(Syscall::TimerFdCreate)
+            }
+            285 => { // fallocate()
+                let fd = regs.rdi as i32;
+                if let Some(file) = self.files.borrow().get(&fd) {
+                    Ok(Syscall::Write(fd, file.clone()))
+                } else {
+                    bail!("fallocate() called on unknown file")
+                }
             }
             289 => { // signalfd
                 Ok(Syscall::SignalFd)
@@ -947,6 +1057,16 @@ impl TracedProcess {
                     };
                 self.files.borrow_mut().insert(fd, file);
             }
+            (Syscall::Dup(fd1), SyscallReturn::Success(fd2)) => {
+                let fd2 = fd2 as i32;
+                trace!("Dup-ing {} to {}", fd1, fd2);
+                if !self.files.borrow().contains_key(&fd1) {
+                    bail!("No such fd {}", fd1);
+                }
+                let file = self.files.borrow().get(&fd1).unwrap().clone();
+                self.files.borrow_mut().insert(fd2, file);
+                
+            }
             (Syscall::Close(fd, _), SyscallReturn::Success(_)) => {
                 trace!("Removing file {} from proc {:?}", fd, self);
                 self.files.borrow_mut().remove(&fd);
@@ -964,6 +1084,11 @@ impl TracedProcess {
             (Syscall::UDPSocket, SyscallReturn::Success(fd)) => {
                 let fd = fd as i32;
                 let file = File::UDPSocket(None);
+                self.files.borrow_mut().insert(fd, file);
+            }
+            (Syscall::GetAddrInfoSocket, SyscallReturn::Success(fd)) => {
+                let fd = fd as i32;
+                let file = File::Special;
                 self.files.borrow_mut().insert(fd, file);
             }
             (Syscall::TcpSocket, SyscallReturn::Success(fd)) => {
@@ -1143,6 +1268,15 @@ impl TracedProcess {
         Ok(())
     }
 
+    fn futex_wait_return(&mut self, futex: u64) -> Result<(), Error> {
+        use libc::EAGAIN;
+        self.run_until_syscall()?;
+        let ret = self.get_syscall_return(Syscall::FutexWait(futex))?;
+        if ret != SyscallReturn::Failure((-1 * EAGAIN).into()) {
+            bail!("Unexpected return during futex wait: {:?}", ret);
+        }
+        Ok(())
+    }
 }
 
 
@@ -1461,60 +1595,58 @@ impl Handlers {
                     // going through! If we allow multiple waiters, we won't
                     // have control over which one gets woken by the kernel!
                     let futex = *futex;
-                    if self.futexes.get(&futex).map_or(0, |w| w.len()) == 0 {
+                    let entry = self.futexes.entry(futex).or_insert_with(|| (None, VecDeque::new()));
+                    if entry.0.is_none() {
+                        // No process is currently waiting, so we should wait
+                        trace!("Proc {:?} waiting on futex {}", procid.clone(), futex);
+                        entry.0 = Some(procid.clone());
                         proc.run_until_syscall()?;
+                    } else {
+                        // A process is already waiting, so we should get ourselves on the queue
+                        trace!("Proc {:?} going on queue for futex {}", procid.clone(), futex);
+                        entry.1.push_back(procid.clone());
                     }
-                    // PThreads is smart about futexes. If it calls wait, the
-                    // futex is actually locked.
-                    let waiters = self.futexes.entry(futex).or_insert(VecDeque::new());
-                    waiters.push_back(procid.clone());
-                    // Don't wait on the next call here--if we did, we would block forever
+                    // Either way, we're done here--we're waiting to be awoken
                 }
                 Syscall::FutexWake(futex, wakes) => {
                     let futex = *futex;
-                    let n_waiters = {
-                        if let Some(waiters) = self.futexes.get(&futex) {
-                            waiters.len()
-                        } else { 0 }
+                    // let's see if a process is actually waiting on this futex,
+                    // and if there's a next process to wake up
+                    let (waiter_id, next_waiter_id) = {
+                        let entry = self.futexes.entry(futex).or_insert_with(|| (None, VecDeque::new()));
+                        (entry.0.take(), entry.1.pop_front())
                     };
-                    match (wakes, n_waiters) {
-                        (_, 0) => {
+                    match (wakes, waiter_id) {
+                        (_, None) => {
                             proc.run_until_syscall()?;
                             let ret = proc.get_syscall_return(call)?;
                             trace!("Process {} got syscall return {:?}", proc, ret);
                             stack.push(procid.clone());
                         }
-                        (1, _) => {
+                        (1, Some(waiter_id)) => {
                             proc.run_until_syscall()?;
                             proc.wait_on_futex_wake()?;
                             trace!("Futex wake woke two processes");
                             stack.push(procid.clone());
-                            // let's wake a process
-                            let waiter_id =
-                                if let Some(waiters) = self.futexes.get_mut(&futex) {
-                                    if let Some(first_waiter_id) = waiters.pop_front() {
-                                        // need to wake this process
-                                        stack.push(first_waiter_id);
-                                    }
-                                    // if there was more than one waiter, need to make sure
-                                    // the next one actually starts waiting
-                                    match waiters.front() {
-                                        Some(waiter_id) => Some(waiter_id.clone()),
-                                        None => None
-                                    }
-                                } else { None };
-                            if let Some(waiter_id) = waiter_id {
+                            // if there are other processes waiting, we should wake one up
+                            if let Some(next_waiter_id) = next_waiter_id {
                                 // let's wake up this waiter
-                                trace!("Letting {:?} wait on futex", waiter_id);
-                                let waiter = self.procs.get_mut(&waiter_id).expect(
-                                    &format!("Bad process identifier {:?}", waiter_id));
-                                waiter.run_until_syscall()?;
+                                trace!("Letting {:?} wait on futex", next_waiter_id);
+                                let waiter = self.procs.get_mut(&next_waiter_id).expect(
+                                    &format!("Bad process identifier {:?}", next_waiter_id));
+                                // the mutex's value will have changed since
+                                // this waiter tried to wait on it before, so
+                                // the syscall will return -EAGAIN. It will then
+                                // try to wait again.
+                                waiter.futex_wait_return(futex)?;
+                                stack.push(next_waiter_id.clone());
                             }
+                            stack.push(waiter_id.clone());
+
                         }
                         _ => bail!("Waking more than one process is currently not supported")
                     }
                 }
-                
                 Syscall::Upcall(n) => {
                     match n {
                         0 => { // detect tracing
@@ -1825,6 +1957,8 @@ impl Handlers {
     pub fn handle_timeout(&mut self, timeout: data::Timeout,
                           response: &mut data::Response)
                           -> Result<(), Error> {
+        // always clear timeout
+        response.cleared_timeouts.push(timeout.clone());
         let node = timeout.to;
         let raw = timeout.raw;
         let timeout_id = TimeoutId::from_bytes(&raw);
@@ -1834,14 +1968,6 @@ impl Handlers {
             }
             let proc = self.procs.get_mut(procid).expect("Bad procid");
             proc.wake_from_stopped_call(call.clone())?;
-            // always clear timeout
-            // don't need raw field on cleared timeout
-            response.cleared_timeouts.push(data::Timeout {
-                to: node,
-                ty: timeout.ty,
-                body: timeout.body,
-                raw: Vec::new()
-            });
             let procid = procid.clone();
             self.fill_response(procid.clone(), response)?;
             self.send_tcp_message(response)?;

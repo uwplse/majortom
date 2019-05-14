@@ -24,7 +24,7 @@ impl Message {
 }
 
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Timeout {
     pub to: String,
     #[serde(rename="type")]
