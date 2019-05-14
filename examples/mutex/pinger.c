@@ -7,6 +7,8 @@
 #include <unistd.h>
 #include <pthread.h>
 
+#include "proteinpills.h"
+
 int sockfd;
 int pings_sent;
 struct addrinfo themhints, *themres;
@@ -14,12 +16,18 @@ struct addrinfo themhints, *themres;
 static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 
 void *background(void *arg) {
-  int secs = *(int*)arg;
-  pthread_mutex_lock(&mutex);
+  int id = *(int*)arg;
   while(1) {
-    sleep(secs);
+    annotate_timeout("Background timeout");
+    int_field("tid", id);
+    sleep(1);
+    pthread_mutex_lock(&mutex);
     sendto(sockfd, "ping", 5, 0, themres->ai_addr, themres->ai_addrlen);
     pings_sent++;
+    annotate_timeout("Timeout with mutex held");
+    int_field("tid", id);
+    sleep(1);
+    pthread_mutex_unlock(&mutex);
   }
 }
 
@@ -57,11 +65,15 @@ int main(int argc, char** argv) {
   socklen_t fromsize = sizeof(from);
 
   pings_sent = 0;
+  annotate_timeout("Start timeout");
   sleep(5);
   pthread_t tid;
-  int secs = 5;
+  int id = 1;
   pthread_mutex_lock(&mutex);
-  pthread_create(&tid, NULL, background, &secs);
+  pthread_create(&tid, NULL, background, &id);
+  id++;
+  pthread_create(&tid, NULL, background, &id);
+  annotate_timeout("Main thread timeout");
   sleep(5);
   pthread_mutex_unlock(&mutex);
   while(1) {
