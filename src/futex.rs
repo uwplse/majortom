@@ -24,9 +24,12 @@ static FUTEX_PRIVATE_FLAG: i32 = 128;
 static FUTEX_CLOCK_REALTIME: i32 = 256;
 static FUTEX_CMD_MASK: i32 = !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
 
+pub static FUTEX_BITSET_MATCH_ANY: u32 = 0xffffffff;
+
+
 #[derive(Debug)]
 pub enum FutexCmd {
-    Wait, Wake, WaitBitset
+    Wait, Wake, WaitBitset, WakeBitset, CmpRequeue
 }
 
 #[derive(Debug)]
@@ -41,6 +44,8 @@ impl Futex {
             x if x == FUTEX_WAIT => Some(FutexCmd::Wait),
             x if x == FUTEX_WAKE => Some(FutexCmd::Wake),
             x if x == FUTEX_WAIT_BITSET => Some(FutexCmd::WaitBitset),
+            x if x == FUTEX_WAKE_BITSET => Some(FutexCmd::WakeBitset),
+            x if x == FUTEX_CMP_REQUEUE => Some(FutexCmd::CmpRequeue),
             _ => None
         };
         let private = (op & FUTEX_PRIVATE_FLAG) != 0;
