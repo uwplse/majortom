@@ -29,7 +29,7 @@ enum File {
     UDPSocket(Option<SocketAddress>),
     EpollFd(Vec<(i32, EpollFlags)>),
     TimerFd(bool, bool), // armed, repeating
-    SignalFd, // armed, repeating
+    SignalFd,
     ReadFile(String),
     WriteFile(String),
     Special
@@ -278,9 +278,8 @@ pub struct Handlers {
     current_state: Option<serde_json::Value>,
     annotate_state_procs: HashMap<TracedProcessIdentifier, TracedProcessIdentifier>,
     current_tcp_message: Option<(SocketAddress, usize)>,
-    // futex -> (current waiter (if any), other waiters (if any))
-    futexes: HashMap<u64, (Option<(u32, TracedProcessIdentifier)>,
-                           VecDeque<(u32, TracedProcessIdentifier)>)>
+    // futex -> waiters (if any)
+    futexes: HashMap<u64, VecDeque<(TracedProcessIdentifier, Syscall)>>
 }
 
 
@@ -327,7 +326,8 @@ enum Syscall {
     // things, so we have some fake Futex calls to disambiguate.
     FutexTest,
     FutexWait(u64, u32),
-    FutexWake(u64, usize, u32, Option<(u64, u32)>),
+    FutexWake(u64, usize, u32),
+    FutexCmpRequeue(u64, usize, u32, u64, u32),
     GetRLimit,
     Clone(CloneFlags),
     SigAltStack,
@@ -466,23 +466,6 @@ impl TracedProcess {
                          snapshot: Rc::clone(&self.snapshot)};
         proc.wait_for_process_start()?;
         Ok((child, proc))
-    }
-
-    fn wait_on_futex_wake(&self) -> Result<(), Error> {
-        // This is a bit hacky. If we let a futex wake go through, two processes
-        // are going to do stuff: the calling process and the process that is
-        // being awakened. We're not sure here what the other pid is, so we're
-        // just going to wait *twice*, make sure both statuses are
-        // PtraceSyscall, and call it a day.
-        use WaitStatus::*;
-        let status1 = self.wait_status()?;
-        let status2 = self.wait_status()?;
-        trace!("Waiting on futex wake, got results {:?} and {:?}", status1, status2);
-        
-        match (status1, status2) {
-            (PtraceSyscall(_), PtraceSyscall(_)) => Ok(()),
-            _ => bail!("Unexpected WaitStatuses {:?} {:?}", status1, status2)
-        }
     }
 
     fn wait_on_syscall(&self) -> Result<(), Error> {
@@ -939,19 +922,18 @@ impl TracedProcess {
                         Futex {cmd: FutexCmd::Wake,
                                private: _,
                                realtime: _} => {
-                            Ok(Syscall::FutexWake(word, val as usize, FUTEX_BITSET_MATCH_ANY, None))
+                            Ok(Syscall::FutexWake(word, val as usize, FUTEX_BITSET_MATCH_ANY))
                         }
                         Futex {cmd: FutexCmd::WakeBitset,
                                private: _,
                                realtime: _} => {
-                            Ok(Syscall::FutexWake(word, val as usize, val3, None))
+                            Ok(Syscall::FutexWake(word, val as usize, val3))
                         }
                         Futex {cmd: FutexCmd::CmpRequeue,
                                private: _,
                                realtime: _} => {
                             let val2 = time_ptr as u32; /* seriously */
-                            Ok(Syscall::FutexWake(word, val as usize, FUTEX_BITSET_MATCH_ANY,
-                                                  Some((uaddr2, val2))))
+                            unimplemented!()
                         }
                         _ => bail!("Bad futex op {:?}", futex)
                     }
@@ -1212,6 +1194,15 @@ impl TracedProcess {
         Ok(())
     }
 
+    fn futex_wake_return(&self, wakes: usize) -> Result<(), Error> {
+        self.run_until_syscall()?;
+        self.wait_on_syscall()?;
+        let mut regs = self.get_registers()?;
+        regs.rax = wakes as u64;
+        self.set_registers(regs)?;
+        Ok(())
+    }
+    
     /// Write addr and data into process's memory to simulate a recvfrom
     fn recvfrom_return(&self, addr: Option<SocketAddress>, data: Vec<u8>)
                        -> Result<(), Error> {
@@ -1289,15 +1280,6 @@ impl TracedProcess {
         Ok(())
     }
 
-    fn futex_wait_return(&mut self, futex: u64) -> Result<(), Error> {
-        use libc::EAGAIN;
-        self.run_until_syscall()?;
-        let ret = self.get_syscall_return(Syscall::FutexWait(futex, 0))?;
-        if ret != SyscallReturn::Failure((-1 * EAGAIN).into()) {
-            bail!("Unexpected return during futex wait: {:?}", ret);
-        }
-        Ok(())
-    }
 }
 
 
@@ -1608,96 +1590,57 @@ impl Handlers {
                     trace!("Process {} got syscall return {:?}", proc, ret);
                     stack.push(procid.clone());
                 }
-                Syscall::FutexWait(futex, bitset) => {
-                    // If there are no waiters, we need the call to actually go
-                    // through now so that subsequent wakes will actually result
-                    // in system calls (remember, PThreads is smart!). However,
-                    // if there are waiters, we need to *prevent* the call from
-                    // going through! If we allow multiple waiters, we won't
-                    // have control over which one gets woken by the kernel!
-                    
+                Syscall::FutexWait(futex, _) => {
+                    // Add us to the queue for this futex
+                    proc.stop_syscall()?;
                     let futex = *futex;
-                    let bitset = *bitset;
-                    let entry = self.futexes.entry(futex).or_insert_with(
-                        || (None, VecDeque::new()));
-                    if entry.0.is_none() {
-                        // No process is currently waiting, so we should wait
-                        trace!("Proc {:?} waiting on futex {} with bitset {}",
-                               procid.clone(), futex, bitset);
-                        entry.0 = Some((bitset, procid.clone()));
-                        proc.run_until_syscall()?;
-                    } else {
-                        // A process is already waiting, so we should get ourselves on the queue
-                        trace!("Proc {:?} going on queue for futex {} with bitset {}",
-                               procid.clone(), futex, bitset);
-                        entry.1.push_back((bitset, procid.clone()));
-                    }
-                    // Either way, we're done here--we're waiting to be awoken
+                    let waiters = self.futexes.entry(futex).or_insert_with(
+                        || VecDeque::new());
+                    trace!("Proc {:?} going on queue for futex {} with call {:?}",
+                           procid.clone(), futex, call);
+                    waiters.push_back((procid.clone(), call.clone()));
+                    // We're done here--we're waiting to be awoken
                 }
-                Syscall::FutexWake(futex, wakes, bitset, requeue) => {
+                Syscall::FutexWake(futex, max_wakes, bitset) => {
+                    proc.stop_syscall()?;
                     let futex = *futex;
-                    // let's see if a process is actually waiting on this futex,
-                    // and if there's a next process to wake up
-                    let (waiter_spec, next_waiter_spec) = {
-                        let entry = self.futexes.entry(futex).or_insert_with(|| (None, VecDeque::new()));
-                        (entry.0.take(), entry.1.pop_front())
-                    };
-                    match (wakes, waiter_spec) {
-                        (_, None) => {
-                            proc.run_until_syscall()?;
-                            let ret = proc.get_syscall_return(call)?;
-                            trace!("Process {} got syscall return {:?}", proc, ret);
-                            stack.push(procid.clone());
-                        }
-                        (1, Some((waiter_bitset, waiter_id))) => {
-                            if waiter_bitset & bitset == 0 {
-                                bail!("Shouldn't wake first waiter due to bitset mismatch {} & {}",
-                                      waiter_bitset, bitset);
-                            }
-                            proc.run_until_syscall()?;
-                            proc.wait_on_futex_wake()?;
-                            trace!("Futex wake woke two processes");
-                            stack.push(procid.clone());
-                            // if there are other processes waiting, we should wake one up
-                            if let Some((next_waiter_bitset, next_waiter_id)) = next_waiter_spec {
-                                match requeue {
-                                    Some((requeue_futex, requeues)) if *requeues > 0 => {
-                                        let requeue_futex = *requeue_futex;
-                                        let requeues = *requeues;
-                                        // We're going to requeue this waiter, and <requeues> other ones
-                                        let mut others_to_requeue: VecDeque<_> = {
-                                            let entry = self.futexes.entry(futex).or_insert_with(|| (None, VecDeque::new()));
-                                            let requeues = std::cmp::min(requeues as usize, entry.1.len());
-                                            entry.1.drain(0..requeues).collect()
-                                        };
-                                        let other_futex_entry = self.futexes.entry(requeue_futex).or_insert_with(
-                                            || (None, VecDeque::new()));
-                                        if other_futex_entry.0.is_none() {
-                                            // next_waiter_id needs to wait on this new futex
-                                            other_futex_entry.0 = Some((next_waiter_bitset, next_waiter_id));
-                                        } else {
-                                            other_futex_entry.1.push_back((next_waiter_bitset, next_waiter_id));
-                                        }
-                                        other_futex_entry.1.append(&mut others_to_requeue);
-                                    }
-                                    _ => {
-                                        // let's wake up this waiter
-                                        trace!("Letting {:?} wait on futex", next_waiter_id);
-                                        let waiter = self.procs.get_mut(&next_waiter_id).expect(
-                                            &format!("Bad process identifier {:?}", next_waiter_id));
-                                        // the mutex's value will have changed since
-                                        // this waiter tried to wait on it before, so
-                                        // the syscall will return -EAGAIN. It will then
-                                        // try to wait again.
-                                        waiter.futex_wait_return(futex)?;
-                                        stack.push(next_waiter_id.clone());
-                                    }
+                    let max_wakes = *max_wakes;
+                    let bitset = *bitset;
+                    // let's see if a process is actually waiting on this futex
+                    let waiters = self.futexes.entry(futex).or_insert_with(
+                        || VecDeque::new());
+                    
+                    /* 
+                    We want to wake as many processes as we can, such that:
+                    1. We wake at most *max_wakes* processes
+                    2. We wake only processes matching the bitset
+                     */
+                    let mut wakes = Vec::<(TracedProcessIdentifier, Syscall)>::new();
+                    let mut i = 0;
+                    while i < waiters.len() && wakes.len() < max_wakes {
+                        match waiters[i].1 {
+                            Syscall::FutexWait(_, waiter_bitset)
+                                if bitset & waiter_bitset != 0 => {
+                                    wakes.push(waiters.remove(i).unwrap());
                                 }
+                            _ => {
+                                // ignore this one
+                                i += 1;
                             }
-                            stack.push(waiter_id.clone());
-
                         }
-                        _ => bail!("Waking more than one process is currently not supported")
+                    }
+                    trace!("Waking {:?}, leaving {:?}", wakes, waiters);
+                    // return to waking process
+                    proc.futex_wake_return(wakes.len())?;
+                    stack.push(procid.clone());
+
+                    // wake other processes
+                    for (waiter_id, call) in wakes {
+                        trace!("Waking process {:?}", waiter_id);
+                        let waiter = self.procs.get_mut(&waiter_id).expect(
+                            &format!("Bad process identifier {:?}", waiter_id));
+                        waiter.wake_from_stopped_call(call)?;
+                        stack.push(waiter_id.clone());
                     }
                 }
                 Syscall::Upcall(n) => {
