@@ -173,6 +173,7 @@ impl FileSystemSnapshot {
 
 #[derive(Debug, Clone)]
 struct TracedProcess {
+    name: String,
     tgid: Pid,
     tid: Pid,
     files: Rc<RefCell<HashMap<i32, File>>>,
@@ -211,28 +212,15 @@ impl TracedProcessIdentifier {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 struct TimeoutId {
+    name: String,
     id: u64
 }
 
 impl TimeoutId {
-    fn new(id: u64) -> Self {
-        Self {id}
-    }
-    
-    fn to_bytes(&self) -> Vec<u8> {
-        let mut ret = Vec::new();
-        ret.extend(&self.id.to_le_bytes());
-        return ret;
-    }
-
-    fn from_bytes(bytes: &[u8]) -> Self {
-        let mut id: u64 = 0;
-        for (i, b) in bytes.iter().enumerate() {
-            id += (*b as u64) << (i * 8);
-        }
-        Self {id}
+    fn new(name: String, id: u64) -> Self {
+        Self {name, id}
     }
 }
 
@@ -356,7 +344,7 @@ enum SyscallReturn {
 }
 
 impl TracedProcess {
-    fn new(program: String) -> Result<Self, Error> {
+    fn new(name: String, program: String) -> Result<Self, Error> {
         let args: Vec<&str> = program.split(" " ).collect();
         let program_name = args[0];
         let mut files = HashMap::new();
@@ -367,7 +355,7 @@ impl TracedProcess {
         let proc = match fork()? {
             ForkResult::Parent {child, ..} => {
                 trace!("Started child with pid {}", child);
-                Self {tgid: child, tid: child, files: Rc::new(RefCell::new(files)),
+                Self {name: name, tgid: child, tid: child, files: Rc::new(RefCell::new(files)),
                       counter: Rc::new(RefCell::new(0)),
                       snapshot: Rc::new(RefCell::new(FileSystemSnapshot::new()?))}
             },
@@ -392,6 +380,11 @@ impl TracedProcess {
     fn next_counter(&self) -> u64 {
         *self.counter.borrow_mut() += 1;
         *self.counter.borrow()
+    }
+
+    fn next_timeout_id(&self) -> TimeoutId {
+        let id = self.next_counter();
+        TimeoutId::new(self.name.clone(), id)
     }
     
     fn kill(&self, nthreads: usize) -> Result<(), Error> {
@@ -449,7 +442,8 @@ impl TracedProcess {
             _ => bail!("Bad status when trying to get clone info: {:?}", status)
         }
         let child = Pid::from_raw(ptrace::getevent(self.tid)? as i32);
-        let proc = Self {tgid: self.tgid, tid: child, files: self.files.clone(),
+        let proc = Self {name: self.name.clone(),
+                         tgid: self.tgid, tid: child, files: self.files.clone(),
                          counter: Rc::clone(&self.counter),
                          snapshot: Rc::clone(&self.snapshot)};
         proc.wait_for_process_start()?;
@@ -617,7 +611,7 @@ impl TracedProcess {
         }
         Ok(())
     }
-    
+
     fn get_syscall(&self) -> Result<Syscall, Error> {
         self.wait_on_syscall()?;
         let regs = self.get_registers()?;
@@ -707,7 +701,7 @@ impl TracedProcess {
                 Ok(Syscall::Dup(fd))
             }
             35 => {
-                let timeout_id = TimeoutId::new(self.next_counter());
+                let timeout_id = self.next_timeout_id();
                 Ok(Syscall::NanoSleep(timeout_id))
             }
             38 => { //setitimer
@@ -1121,7 +1115,7 @@ impl TracedProcess {
             }
             (Syscall::TimerFdCreate, SyscallReturn::Success(fd)) => {
                 let fd = fd as i32;
-                let timeout_id = TimeoutId::new(self.next_counter());
+                let timeout_id = self.next_timeout_id();
                 let file = File::TimerFd(timeout_id, false, false);
                 self.files.borrow_mut().insert(fd, file);
             }
@@ -1335,7 +1329,7 @@ impl Handlers {
 
     fn get_current_timeout(&mut self, node: String, timeout_id: TimeoutId) -> data::Timeout {
         let mut timeout = self.current_timeout.take().unwrap_or_else(|| data::Timeout::new());
-        timeout.raw.extend(timeout_id.to_bytes());
+        timeout.raw = serde_json::to_value(timeout_id).unwrap();
         timeout.to = node;
         timeout
     }
@@ -1828,7 +1822,7 @@ impl Handlers {
         // need to make sure old process dies before new process starts
         self.kill_process(procid.clone())?;
         let program = &self.nodes[&node];
-        let proc = TracedProcess::new(program.to_string())?;
+        let proc = TracedProcess::new(node.clone(), program.to_string())?;
         self.procs.insert(procid.clone(), proc);
         self.fill_response(procid.clone(), response)?;
         self.send_tcp_message(response)?;
@@ -1992,7 +1986,7 @@ impl Handlers {
         response.cleared_timeouts.push(timeout.clone());
         let node = timeout.to;
         let raw = timeout.raw;
-        let timeout_id = TimeoutId::from_bytes(&raw);
+        let timeout_id = serde_json::from_value(raw)?;
         if let Some((procid, call)) = self.timeout_waiting_procs.get(&timeout_id) {
             if procid.name != node {
                 bail!("Timeout sent to mismatched node ({}, {})", procid.name, node);

@@ -30,7 +30,7 @@ pub struct Timeout {
     #[serde(rename="type")]
     pub ty: String,
     pub body: j::Value,
-    pub raw: Vec<u8>
+    pub raw: j::Value
 }
 
 impl Timeout {
@@ -39,7 +39,7 @@ impl Timeout {
             to: "".to_string(),
             ty: "timeout".to_string(),
             body: json!({}),
-            raw: Vec::new()
+            raw: json!({})
         }
     }
 }
