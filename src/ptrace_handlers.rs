@@ -27,8 +27,8 @@ use crate::data;
 enum File {
     TcpSocket(Option<SocketAddress>),
     UDPSocket(Option<SocketAddress>),
-    EpollFd(Vec<(i32, EpollFlags)>),
-    TimerFd(bool, bool), // armed, repeating
+    EpollFd(Vec<(i32, EpollFlags, u64)>),
+    TimerFd(TimeoutId, bool, bool), // armed, repeating
     SignalFd,
     ReadFile(String),
     WriteFile(String),
@@ -217,6 +217,10 @@ struct TimeoutId {
 }
 
 impl TimeoutId {
+    fn new(id: u64) -> Self {
+        Self {id}
+    }
+    
     fn to_bytes(&self) -> Vec<u8> {
         let mut ret = Vec::new();
         ret.extend(&self.id.to_le_bytes());
@@ -229,22 +233,6 @@ impl TimeoutId {
             id += (*b as u64) << (i * 8);
         }
         Self {id}
-    }
-}
-    
-struct TimeoutIdGenerator {
-    next_id: u64
-}
-
-impl TimeoutIdGenerator {
-    fn new() -> Self {
-        Self {next_id: 0}
-    }
-
-    fn next(&mut self) -> TimeoutId {
-        let next = TimeoutId {id: self.next_id};
-        self.next_id += 1;
-        next
     }
 }
 
@@ -269,7 +257,6 @@ pub struct Handlers {
     nodes: HashMap<String, String>,
     procs: HashMap<TracedProcessIdentifier, TracedProcess>,
     message_waiting_procs: HashMap<SocketAddress, (TracedProcessIdentifier, Syscall)>,
-    timeout_id_generator: TimeoutIdGenerator,
     timeout_waiting_procs: HashMap<TimeoutId, (TracedProcessIdentifier, Syscall)>,
     address_to_name: HashMap<SocketAddress, String>,
     tcp_channels: HashMap<(String, u64), TcpChannel>,
@@ -318,7 +305,7 @@ enum Syscall {
     RecvFrom(i32, File, usize),
     SigProcMask,
     SigAction,
-    NanoSleep,
+    NanoSleep(TimeoutId),
     SendTo(i32, File, Option<SocketAddress>, Vec<u8>),
     SetTidAddress,
     SetRobustList,
@@ -358,7 +345,8 @@ enum Syscall {
     SignalFd,
     EpollCreate,
     // EpollFlags must be set if op is add or mod
-    EpollCtl(i32, EpollOp, i32, Option<EpollFlags>),
+    EpollCtl(i32, EpollOp, i32, Option<EpollFlags>, Option<u64>),
+    EpollWait(File, u64, usize, i32),
     Upcall(usize),
 }
 
@@ -718,7 +706,10 @@ impl TracedProcess {
                 let fd = regs.rdi as i32;
                 Ok(Syscall::Dup(fd))
             }
-            35 => Ok(Syscall::NanoSleep),
+            35 => {
+                let timeout_id = TimeoutId::new(self.next_counter());
+                Ok(Syscall::NanoSleep(timeout_id))
+            }
             38 => { //setitimer
                 // Currently we only allow programs to set the
                 // profiling timer, which we ignore.
@@ -948,6 +939,14 @@ impl TracedProcess {
                 Ok(Syscall::GetTime)
             }
             218 => Ok(Syscall::SetTidAddress),
+            232 => { // epoll_wait
+                let epfd = regs.rdi as i32;
+                let file = self.files.borrow().get(&epfd).unwrap().clone();
+                let events_ptr = regs.rsi as u64;
+                let max_events = regs.rdx as usize;
+                let timeout = regs.r10 as i32;
+                Ok(Syscall::EpollWait(file, events_ptr, max_events, timeout))
+            }
             233 => { // epoll_ctl
                 let epfd = regs.rdi as i32;
                 let op: EpollOp = match regs.rsi as i32 {
@@ -957,21 +956,19 @@ impl TracedProcess {
                     _ => bail!("Bad epoll op")
                 };
                 let fd = regs.rdx as i32;
-                let flags = {
-                    if regs.r10 == 0 {
-                        if op == EpollOp::EpollCtlDel {
-                            None
-                        } else {
-                            bail!("Epoll called with null events");
+                let (flags, data) =
+                    match (op, regs.r10) {
+                        (EpollOp::EpollCtlDel, _) => (None, None),
+                        (_, addr) if addr != 0 => {
+                            let event_struct: epoll_event = unsafe {
+                                self.read(addr)?
+                            };
+                            (Some(EpollFlags::from_bits(event_struct.events as i32).unwrap()),
+                             Some(event_struct.u64))
                         }
-                    } else {
-                        let event_struct: epoll_event = unsafe {
-                            self.read(regs.r10)?
-                        };
-                        Some(EpollFlags::from_bits(event_struct.events as i32).unwrap())
-                    }
-                };
-                Ok(Syscall::EpollCtl(epfd, op, fd, flags))
+                        _ => bail!("Bad epoll op and addr {:?} {}", op, regs.r10)
+                    };
+                Ok(Syscall::EpollCtl(epfd, op, fd, flags, data))
             }
             257 => { // openat()
                 let fd = regs.rdi as i32;
@@ -1124,7 +1121,8 @@ impl TracedProcess {
             }
             (Syscall::TimerFdCreate, SyscallReturn::Success(fd)) => {
                 let fd = fd as i32;
-                let file = File::TimerFd(false, false);
+                let timeout_id = TimeoutId::new(self.next_counter());
+                let file = File::TimerFd(timeout_id, false, false);
                 self.files.borrow_mut().insert(fd, file);
             }
             (Syscall::SignalFd, SyscallReturn::Success(fd)) => {
@@ -1137,18 +1135,19 @@ impl TracedProcess {
                 let file = File::EpollFd(Vec::new());
                 self.files.borrow_mut().insert(fd, file);
             }
-            (Syscall::EpollCtl(epfd, op, fd, flags), SyscallReturn::Success(_)) => {
+            (Syscall::EpollCtl(epfd, op, fd, flags, data), SyscallReturn::Success(_)) => {
                 use EpollOp::*;
                 match self.files.borrow_mut().get_mut(&epfd) {
                     Some(File::EpollFd(fds)) => {
                         match op {
                             EpollCtlAdd => {
-                                fds.push((fd, flags.unwrap()))
+                                fds.push((fd, flags.unwrap(), data.unwrap()))
                             }
                             EpollCtlMod => {
                                 for entry in fds.iter_mut() {
                                     if entry.0 == fd {
-                                        entry.1 = flags.unwrap()
+                                        entry.1 = flags.unwrap();
+                                        entry.2 = data.unwrap();
                                     }
                                 }
                             }
@@ -1287,7 +1286,6 @@ impl TracedProcess {
 impl Handlers {
     pub fn new(nodes: HashMap<String, String>) -> Self {
         Self {nodes, procs: HashMap::new(), message_waiting_procs: HashMap::new(),
-              timeout_id_generator: TimeoutIdGenerator::new(),
               timeout_waiting_procs: HashMap::new(),
               annotate_state_procs: HashMap::new(),
               address_to_name: HashMap::new(),
@@ -1509,12 +1507,12 @@ impl Handlers {
                                                       (procid.clone(),
                                                        call.clone()));
                 }
-                Syscall::NanoSleep => {
+                Syscall::NanoSleep(timeout_id) => {
                     proc.stop_syscall()?;
-                    let timeout_id = self.timeout_id_generator.next();
                     self.timeout_waiting_procs.insert(timeout_id.clone(),
                                                       (procid.clone(), call.clone()));
-                    let timeout = self.get_current_timeout(procid.name.clone(), timeout_id);
+                    let timeout = self.get_current_timeout(procid.name.clone(),
+                                                           timeout_id.clone());
                     response.timeouts.push(timeout);
                     // we're blocking, so we're done here
                 }
@@ -1676,6 +1674,9 @@ impl Handlers {
                     let other_waiters = self.futexes.entry(futex2).or_insert_with(
                         || VecDeque::new());
                     other_waiters.append(&mut moves);
+                }
+                Syscall::EpollWait(epfd, events_ptr, max_events, timeout) => {
+                    unimplemented!();
                 }
                 Syscall::Upcall(n) => {
                     match n {
