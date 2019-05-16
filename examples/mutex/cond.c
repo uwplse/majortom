@@ -18,6 +18,11 @@ static pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
 
 int bananas;
 
+void state_function() {
+  int_field("bananas", bananas);
+}
+
+
 void *consumer(void *arg) {
   int id = *(int*)arg;
     while(1) {
@@ -25,7 +30,7 @@ void *consumer(void *arg) {
       int_field("tid", id);
       sleep(1);
       pthread_mutex_lock(&mutex);
-      if (!bananas) {
+      while (!bananas) {
         pthread_cond_wait(&cond, &mutex);
       }
       bananas -= 1;
@@ -40,6 +45,7 @@ int main(int argc, char** argv) {
   if (argc != 1) {
     return -1;
   }
+  register_state_function(state_function);
   bananas = 0;
   annotate_timeout("Start timeout");
   sleep(5);

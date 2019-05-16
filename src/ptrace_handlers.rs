@@ -327,7 +327,7 @@ enum Syscall {
     FutexTest,
     FutexWait(u64, u32),
     FutexWake(u64, usize, u32),
-    FutexCmpRequeue(u64, usize, u32, u64, u32),
+    FutexCmpRequeue(u64, usize, u64, usize),
     GetRLimit,
     Clone(CloneFlags),
     SigAltStack,
@@ -933,7 +933,7 @@ impl TracedProcess {
                                private: _,
                                realtime: _} => {
                             let val2 = time_ptr as u32; /* seriously */
-                            unimplemented!()
+                            Ok(Syscall::FutexCmpRequeue(word, val as usize, uaddr2, val2 as usize))
                         }
                         _ => bail!("Bad futex op {:?}", futex)
                     }
@@ -1642,6 +1642,40 @@ impl Handlers {
                         waiter.wake_from_stopped_call(call)?;
                         stack.push(waiter_id.clone());
                     }
+                }
+                Syscall::FutexCmpRequeue(futex, max_wakes, futex2, max_moves) => {
+                    // TODO: worry about CMP? i think we don't need to due to
+                    // coarse scheduling granularity
+                    proc.stop_syscall()?;
+                    let futex = *futex;
+                    let futex2 = *futex2;
+                    let max_wakes = *max_wakes;
+                    let max_moves = *max_moves;
+                    // let's see if a process is actually waiting on this futex
+                    let waiters = self.futexes.entry(futex).or_insert_with(
+                        || VecDeque::new());
+
+                    let max_wakes = std::cmp::min(max_wakes, waiters.len());
+                    let wakes: Vec<_> = waiters.drain(0..max_wakes).collect();
+                    let max_moves = std::cmp::min(max_moves, waiters.len());
+                    let mut moves: VecDeque<_> = waiters.drain(0..max_moves).collect();
+                    trace!("Waking {:?}, requeueing {:?}, leaving {:?}", wakes, moves, waiters);
+                    // return to waking process
+                    proc.futex_wake_return(wakes.len())?;
+                    stack.push(procid.clone());
+
+                    // wake waking processes
+                    for (waiter_id, call) in wakes {
+                        trace!("Waking process {:?}", waiter_id);
+                        let waiter = self.procs.get_mut(&waiter_id).expect(
+                            &format!("Bad process identifier {:?}", waiter_id));
+                        waiter.wake_from_stopped_call(call)?;
+                        stack.push(waiter_id.clone());
+                    }
+                    // move moving processes
+                    let other_waiters = self.futexes.entry(futex2).or_insert_with(
+                        || VecDeque::new());
+                    other_waiters.append(&mut moves);
                 }
                 Syscall::Upcall(n) => {
                     match n {
