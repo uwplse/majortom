@@ -25,7 +25,7 @@ use crate::data;
 
 #[derive(Debug, Clone, PartialEq)]
 enum File {
-    TcpSocket(Option<SocketAddress>),
+    TcpSocket(Option<SocketAddress>, bool),
     UDPSocket(Option<SocketAddress>),
     EpollFd(Vec<(i32, EpollFlags, u64)>),
     TimerFd(TimeoutId, bool, bool), // armed, repeating
@@ -282,7 +282,7 @@ enum Syscall {
     Close(i32, File),
     Read(i32, File),
     UDPSocket,
-    TcpSocket,
+    TcpSocket(SockFlag),
     GetAddrInfoSocket,
     SpecialOp,
     Bind(i32, SocketAddress),
@@ -718,6 +718,7 @@ impl TracedProcess {
                 let socket_family = regs.rdi as i32;
                 let socket_type_and_flags = regs.rsi as i32;
                 let socket_type = socket_type_and_flags & !(SockFlag::all().bits());
+                let flags = SockFlag::from_bits_truncate(socket_type_and_flags);
                 let socket_protocol = regs.rdx as i32;
                 // ensure this is a supported socket type
                 if (socket_family == AddressFamily::Inet as i32 ||
@@ -730,7 +731,7 @@ impl TracedProcess {
                     socket_family == AddressFamily::Inet6 as i32) &&
                     (socket_type == SockType::Stream as i32 ||
                      socket_protocol == SockProtocol::Tcp as i32) {
-                        Ok(Syscall::TcpSocket)
+                        Ok(Syscall::TcpSocket(flags))
                     }
                 // special-case wacky getaddrinfo() sockets
                 else if (socket_family == 16 &&
@@ -1102,9 +1103,9 @@ impl TracedProcess {
                 let file = File::Special;
                 self.files.borrow_mut().insert(fd, file);
             }
-            (Syscall::TcpSocket, SyscallReturn::Success(fd)) => {
+            (Syscall::TcpSocket(flags), SyscallReturn::Success(fd)) => {
                 let fd = fd as i32;
-                let file = File::TcpSocket(None);
+                let file = File::TcpSocket(None, flags.intersects(SockFlag::SOCK_NONBLOCK));
                 self.files.borrow_mut().insert(fd, file);
             }
             (Syscall::Bind(fd, addr), SyscallReturn::Success(_)) => {
