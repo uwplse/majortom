@@ -334,7 +334,7 @@ enum Syscall {
     EpollCreate,
     // EpollFlags must be set if op is add or mod
     EpollCtl(i32, EpollOp, i32, Option<EpollFlags>, Option<u64>),
-    EpollWait(File, u64, usize, i32),
+    EpollWait(Vec<(File, EpollFlags, u64)>, u64, usize, i32),
     Upcall(usize),
 }
 
@@ -936,10 +936,19 @@ impl TracedProcess {
             232 => { // epoll_wait
                 let epfd = regs.rdi as i32;
                 let file = self.files.borrow().get(&epfd).unwrap().clone();
+                let files: Vec<_> = match file {
+                    File::EpollFd(files) => {
+                        files.iter().map(
+                            |(fd, flags, data)|
+                            (self.files.borrow().get(&fd).unwrap().clone(),
+                             flags.clone(), data.clone())).collect()
+                    }
+                    _ => bail!("epoll_wait() on bad file")
+                };
                 let events_ptr = regs.rsi as u64;
                 let max_events = regs.rdx as usize;
                 let timeout = regs.r10 as i32;
-                Ok(Syscall::EpollWait(file, events_ptr, max_events, timeout))
+                Ok(Syscall::EpollWait(files, events_ptr, max_events, timeout))
             }
             233 => { // epoll_ctl
                 let epfd = regs.rdi as i32;
@@ -1010,6 +1019,14 @@ impl TracedProcess {
                     Ok(Syscall::Write(fd, file.clone()))
                 } else {
                     bail!("fallocate() called on unknown file")
+                }
+            }
+            288 => { // accept4()
+                let fd = regs.rdi as i32;
+                if let Some(sock) = self.files.borrow().get(&fd) {
+                    Ok(Syscall::Accept(fd, sock.clone())) // ignore flags for now
+                } else {
+                    bail!("accept() called on unknown file")
                 }
             }
             289 => { // signalfd
@@ -1262,14 +1279,34 @@ impl TracedProcess {
         Ok(())
     }
 
-    fn continue_return(&mut self, fd: i32, addr: SocketAddress) -> Result<(), Error> {
+    fn connect_return(&mut self, fd: i32, addr: SocketAddress) -> Result<(), Error> {
         self.wait_on_syscall()?;
         let regs = self.get_registers()?;
         let sys_ret = regs.rax as i64;
         if sys_ret < 0 {
-            bail!("continue() failed");
+            bail!("connect() failed: {}", sys_ret);
         }
         self.files.borrow_mut().insert(fd, File::TcpSocket(Some(addr)));
+        Ok(())
+    }
+
+    fn epoll_return(&mut self, event_ptr: u64, data: u64, event: u32) -> Result<(), Error> {
+        self.run_until_syscall()?;
+        self.wait_on_syscall()?;
+
+        // write events into memory
+        let e = epoll_event {
+            events: event,
+            u64: data // yikes
+        };
+        unsafe {
+            self.write(event_ptr, e)?;
+        }
+
+        // fake return value (always 1, bc one event)
+        let mut regs = self.get_registers()?;
+        regs.rax = 1 as u64;
+        self.set_registers(regs)?;
         Ok(())
     }
 
@@ -1433,6 +1470,7 @@ impl Handlers {
                 Syscall::SetSockOpt(_, level, opt) => {
                     match (*level, *opt) {
                         (libc::SOL_SOCKET, libc::SO_REUSEADDR) => (),
+                        (libc::IPPROTO_TCP, libc::TCP_NODELAY) => (),
                         _ => bail!("Unsupported setsockopt: {}/{}", level, opt)
                     }
                 }
@@ -1669,8 +1707,36 @@ impl Handlers {
                         || VecDeque::new());
                     other_waiters.append(&mut moves);
                 }
-                Syscall::EpollWait(epfd, events_ptr, max_events, timeout) => {
-                    unimplemented!();
+                Syscall::EpollWait(files, events_ptr, _max_events, timeout) => {
+                    proc.stop_syscall()?;
+                    // we don't care about max_events--we're only ever going to return one
+                    use File::*;
+                    if *timeout != -1 {
+                        bail!("epoll_wait() timeouts not yet supported");
+                    }
+                    for (file, flags, data) in files {
+                        // depending on what this file is, we're going to either
+                        // (a) ignore it (signal fds)
+                        // (b) add this call to message_waiting_procs (socket fds)
+                        // (c) add this call to timeout_waiting_procs (timer fds)
+                        // (d) throw an error (other fds)
+                        match file {
+                            SignalFd => (),
+                            TimerFd(timeout_id, _, _) => {
+                                self.timeout_waiting_procs.insert(
+                                    timeout_id.clone(),
+                                    (procid.clone(), call.clone()));
+                            }
+                            TcpSocket(Some(addr)) => {
+                                self.message_waiting_procs.insert(
+                                    addr.clone(),
+                                    (procid.clone(), call.clone()));
+                            }
+                            UDPSocket(_) =>
+                                bail!("epoll_wait not yet supported for UDP"),
+                            f => bail!("epoll_wait on bad fd {:?}", f)
+                        }
+                    }
                 }
                 Syscall::Upcall(n) => {
                     match n {
@@ -1835,6 +1901,29 @@ impl Handlers {
         let node = message.to;
         let raw = message.raw;
         let wire_message : WireMessage = serde_json::from_value(raw)?;
+        // first, handle epoll waiter
+        if let Some((procid, Syscall::EpollWait(files, event_ptr, _, _))) =
+            self.message_waiting_procs.get(&wire_message.to)
+        {
+            // we need to find the specific file we were waiting on
+            let data = files.iter().find_map(
+                |(file, flags, data)| match file {
+                    File::TcpSocket(Some(addr)) if *addr == wire_message.to =>
+                        Some(*data),
+                    _ => None
+                });
+            if let Some(data) = data {
+                let proc = self.procs.get_mut(&procid.clone()).expect("Bad procid");
+                proc.epoll_return(*event_ptr, data, libc::EPOLLIN as u32)?;
+                let procid = procid.clone();
+                // we're going to run this process until it blocks again,
+                // then deliver the message
+                self.fill_response(procid.clone(), response)?;
+            } else {
+                bail!("no matching epoll event found");
+            }
+        }
+        
         // first, deliver a TCP message if necessary
         if let MessageData::TcpMessage(size) = &wire_message.data {
             trace!("Got TCP message of size {}", size);
@@ -1938,7 +2027,7 @@ impl Handlers {
                                             &remote_channel_id).unwrap();
                                         remote_channel.remote = Some(stream.try_clone().unwrap());
                                     }
-                                    proc.continue_return(*fd,
+                                    proc.connect_return(*fd,
                                                          SocketAddress::TcpStream(procid.name.clone(),
                                                                                   local_stream_id))?;
                                     
@@ -1988,15 +2077,22 @@ impl Handlers {
         let raw = timeout.raw;
         let timeout_id = serde_json::from_value(raw)?;
         if let Some((procid, call)) = self.timeout_waiting_procs.get(&timeout_id) {
+            let procid = procid.clone();
             if procid.name != node {
                 bail!("Timeout sent to mismatched node ({}, {})", procid.name, node);
             }
-            let proc = self.procs.get_mut(procid).expect("Bad procid");
-            proc.wake_from_stopped_call(call.clone())?;
-            let procid = procid.clone();
-            self.fill_response(procid.clone(), response)?;
+            match call {
+                Syscall::NanoSleep(_) => {
+                    let proc = self.procs.get_mut(&procid.clone()).expect("Bad procid");
+                    proc.wake_from_stopped_call(call.clone())?;
+                    let procid = procid.clone();
+                    self.fill_response(procid, response)?;
+                }
+                Syscall::EpollWait(_, _, _, _) => unimplemented!(),
+                _ => bail!("unexpected call {:?} receiving timeout")
+            }
             self.send_tcp_message(response)?;
-            self.get_state(procid.parent_process(), response)?;
+            self.get_state(procid.clone().parent_process(), response)?;
             Ok(())
         } else {
             bail!("Timeout to unknown recipient")
