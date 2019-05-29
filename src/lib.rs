@@ -27,6 +27,7 @@ pub mod oddity;
 pub mod ptrace_handlers;
 pub mod data;
 pub mod futex;
+pub mod clock;
 
 pub fn majortom(config: config::Config) -> Result<(), failure::Error> {
     trace!("Running with config {:?}", config);

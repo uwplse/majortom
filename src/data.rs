@@ -30,7 +30,9 @@ pub struct Timeout {
     #[serde(rename="type")]
     pub ty: String,
     pub body: j::Value,
-    pub raw: j::Value
+    pub raw: j::Value,
+    #[serde(rename="unique-id")]
+    pub unique_id: j::Value
 }
 
 impl Timeout {
@@ -39,8 +41,15 @@ impl Timeout {
             to: "".to_string(),
             ty: "timeout".to_string(),
             body: json!({}),
-            raw: json!({})
+            raw: json!({}),
+            unique_id: json!({})
         }
+    }
+
+    pub fn clear(id: j::Value) -> Self {
+        let mut t = Self::new();
+        t.unique_id = id;
+        t
     }
 }
 

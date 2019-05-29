@@ -74,11 +74,11 @@ impl<'a> OddityConnection<'a> {
             Some(false) => bail!("Registration failed"),
             None => bail!("Malformed registration response")
         }
-        trace!("Connected to Oddity server");
+        info!("Connected to Oddity server");
         loop {
             let req: Request = self.read_typed()?;
             let mut response: Response = Response::new();
-            trace!("Got request from Oddity server: {:?}", req);
+            info!("Got request from Oddity server: {:?}", req);
             let quit = match req {
                 Request::Start {to} => {
                     self.handlers.handle_start(to, &mut response)?;
@@ -97,7 +97,8 @@ impl<'a> OddityConnection<'a> {
             if quit {
                 return Ok(());
             }
-            trace!("Returning response to server: {:?}", response);
+            info!("Returning response to server: {:?}", response);
+            //trace!("Handlers: {:?}", self.handlers);
             self.write_typed(&response)?;
         }
     }

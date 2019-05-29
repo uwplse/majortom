@@ -37,6 +37,9 @@ void *consumer(void *arg) {
       annotate_timeout("Eating a banana");
       int_field("tid", id);
       sleep(1);
+      if (bananas > 0) {
+        pthread_cond_signal(&cond);
+      }
       pthread_mutex_unlock(&mutex);
   }
 }
@@ -66,7 +69,7 @@ int main(int argc, char** argv) {
     sleep(1);
     pthread_mutex_lock(&mutex);
     bananas += 3;
-    pthread_cond_broadcast(&cond);
+    pthread_cond_signal(&cond);
     pthread_mutex_unlock(&mutex);
   }
 }

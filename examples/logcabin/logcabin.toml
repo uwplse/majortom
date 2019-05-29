@@ -1,0 +1,8 @@
+[oddity]
+address="10.0.2.2:4343"
+
+[nodes]
+node1="./logcabin-src/build/LogCabin --config logcabin-1.conf"
+node2="./logcabin-src/build/LogCabin --config logcabin-2.conf"
+node3="./logcabin-src/build/LogCabin --config logcabin-3.conf"
+client="./logcabin-src/build/Examples/Reconfigure --cluster=127.0.0.1:5254,127.0.0.1:5255,127.0.0.1:5256 set 127.0.0.1:5254 127.0.0.1:5255 127.0.0.1:5256"
