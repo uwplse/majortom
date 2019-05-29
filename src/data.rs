@@ -4,12 +4,11 @@ use serde_json as j;
 pub struct Message {
     pub from: String,
     pub to: String,
-    #[serde(rename="type")]
+    #[serde(rename = "type")]
     pub ty: String,
     pub body: j::Value,
-    pub raw: j::Value
+    pub raw: j::Value,
 }
-
 
 impl Message {
     pub fn new() -> Self {
@@ -18,21 +17,20 @@ impl Message {
             to: "".to_string(),
             ty: "message".to_string(),
             body: json!({}),
-            raw: json!({})
+            raw: json!({}),
         }
     }
 }
 
-
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Timeout {
     pub to: String,
-    #[serde(rename="type")]
+    #[serde(rename = "type")]
     pub ty: String,
     pub body: j::Value,
     pub raw: j::Value,
-    #[serde(rename="unique-id")]
-    pub unique_id: j::Value
+    #[serde(rename = "unique-id")]
+    pub unique_id: j::Value,
 }
 
 impl Timeout {
@@ -42,7 +40,7 @@ impl Timeout {
             ty: "timeout".to_string(),
             body: json!({}),
             raw: json!({}),
-            unique_id: json!({})
+            unique_id: json!({}),
         }
     }
 
@@ -54,29 +52,27 @@ impl Timeout {
 }
 
 #[derive(Deserialize, Debug)]
-#[serde(tag="msgtype")]
+#[serde(tag = "msgtype")]
 pub enum Request {
-    #[serde(rename="start")]
-    Start {
-        to: String
-    },
-    #[serde(rename="msg")]
+    #[serde(rename = "start")]
+    Start { to: String },
+    #[serde(rename = "msg")]
     Message(Message),
-    #[serde(rename="timeout")]
+    #[serde(rename = "timeout")]
     Timeout(Timeout),
-    #[serde(rename="quit")]
-    Quit {}
+    #[serde(rename = "quit")]
+    Quit {},
 }
 
 #[derive(Serialize, Debug)]
 pub struct Response {
-    #[serde(rename="send-messages")]
+    #[serde(rename = "send-messages")]
     pub messages: Vec<Message>,
-    #[serde(rename="set-timeouts")]
+    #[serde(rename = "set-timeouts")]
     pub timeouts: Vec<Timeout>,
-    #[serde(rename="cleared-timeouts")]
+    #[serde(rename = "cleared-timeouts")]
     pub cleared_timeouts: Vec<Timeout>,
-    pub states: j::Value
+    pub states: j::Value,
 }
 
 impl Response {
@@ -85,7 +81,7 @@ impl Response {
             messages: Vec::new(),
             timeouts: Vec::new(),
             cleared_timeouts: Vec::new(),
-            states: json!({})
-        }
+            states: json!({}),
+        };
     }
 }

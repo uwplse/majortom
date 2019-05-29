@@ -1,8 +1,8 @@
-use std::path::PathBuf;
 use std::env::set_current_dir;
+use std::path::PathBuf;
 use std::process::Command;
 
-use clap::{App,Arg};
+use clap::{App, Arg};
 
 use majortom::{config, majortom, setup_logging};
 
@@ -11,10 +11,13 @@ fn main() {
         .version("0.1")
         .author("Doug Woos <dwoos@cs.washington.edu>")
         .about("Example driver")
-        .arg(Arg::with_name("EXAMPLE")
-             .help("The example system to run")
-             .required(true)
-             .index(1)).get_matches();
+        .arg(
+            Arg::with_name("EXAMPLE")
+                .help("The example system to run")
+                .required(true)
+                .index(1),
+        )
+        .get_matches();
 
     let example = matches.value_of("EXAMPLE").unwrap();
     let mut example_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -28,8 +31,7 @@ fn main() {
     if !make_status.success() {
         panic!("Failed to build example {}", example)
     }
-    let config = config::read(&format!("{}.toml", example))
-        .expect("Failed to read config file");
+    let config = config::read(&format!("{}.toml", example)).expect("Failed to read config file");
     setup_logging();
     majortom(config).expect("Error");
 }

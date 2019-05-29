@@ -15,24 +15,24 @@ extern crate failure;
 //extern crate failure_derive;
 #[macro_use]
 extern crate log;
-extern crate fern;
-extern crate chrono;
-extern crate libc;
-extern crate tempfile;
 extern crate base64;
 extern crate base64_serde;
+extern crate chrono;
+extern crate fern;
+extern crate libc;
+extern crate tempfile;
 
+pub mod clock;
 pub mod config;
-pub mod oddity;
-pub mod ptrace_handlers;
 pub mod data;
 pub mod futex;
-pub mod clock;
+pub mod oddity;
+pub mod ptrace_handlers;
 
 pub fn majortom(config: config::Config) -> Result<(), failure::Error> {
     trace!("Running with config {:?}", config);
     let mut handlers = ptrace_handlers::Handlers::new(config.nodes);
-    
+
     // set up oddity connection
     let mut oddity = oddity::OddityConnection::new(config.oddity, &mut handlers)?;
     oddity.run()?;
@@ -44,13 +44,11 @@ pub fn setup_logging() {
         .chain(
             fern::Dispatch::new()
                 .format(|out, message, record| {
-                    out.finish(format_args!(
-                        "[{}] {}",
-                        record.level(),
-                        message))
+                    out.finish(format_args!("[{}] {}", record.level(), message))
                 })
                 .level(log::LevelFilter::Trace)
-                .chain(std::io::stdout()))
+                .chain(std::io::stdout()),
+        )
         .chain(
             fern::Dispatch::new()
                 .format(|out, message, record| {
@@ -59,9 +57,12 @@ pub fn setup_logging() {
                         chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
                         record.level(),
                         record.target(),
-                        message))
+                        message
+                    ))
                 })
                 .level(log::LevelFilter::Trace)
-                .chain(fern::log_file("majortom.log").expect("couldn't open log file")))
-        .apply().expect("Error setting up logging");
+                .chain(fern::log_file("majortom.log").expect("couldn't open log file")),
+        )
+        .apply()
+        .expect("Error setting up logging");
 }
