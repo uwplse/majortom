@@ -1,6 +1,6 @@
 use libc::timespec;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub struct Clock {
     sec: u64,
     nsec: u64,
@@ -32,7 +32,7 @@ impl Clock {
     fn normalize(&mut self) {
         if self.nsec >= 1_000_000_000 {
             self.sec += self.nsec / 1_000_000_000;
-            self.nsec = self.nsec % 1_000_000_000;
+            self.nsec %= 1_000_000_000;
         }
     }
 

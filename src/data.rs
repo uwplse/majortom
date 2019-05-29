@@ -1,6 +1,6 @@
 use serde_json as j;
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Default)]
 pub struct Message {
     pub from: String,
     pub to: String,
@@ -22,7 +22,7 @@ impl Message {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct Timeout {
     pub to: String,
     #[serde(rename = "type")]
@@ -64,7 +64,7 @@ pub enum Request {
     Quit {},
 }
 
-#[derive(Serialize, Debug)]
+#[derive(Serialize, Debug, Default)]
 pub struct Response {
     #[serde(rename = "send-messages")]
     pub messages: Vec<Message>,
@@ -77,11 +77,11 @@ pub struct Response {
 
 impl Response {
     pub fn new() -> Self {
-        return Self {
+        Self {
             messages: Vec::new(),
             timeouts: Vec::new(),
             cleared_timeouts: Vec::new(),
             states: json!({}),
-        };
+        }
     }
 }

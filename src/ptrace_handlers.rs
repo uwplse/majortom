@@ -1,9 +1,13 @@
+#![allow(dead_code)]
+#![allow(unused_imports)]
+
 use crate::clock::Clock;
 use crate::futex::{
     Futex, FutexCmd, FutexWakeCmp, FutexWakeOp, FutexWakeOpArgs, FUTEX_BITSET_MATCH_ANY,
 };
 use base64_serde::base64_serde_type;
-use failure::{Error, ResultExt};
+use failure::Error;
+use failure::ResultExt;
 #[cfg(target_os = "linux")]
 use libc::{epoll_event, user_regs_struct};
 use nix::fcntl::OFlag;
@@ -16,9 +20,11 @@ use nix::sys::socket::{
     sockaddr_in, sockaddr_storage, AddressFamily, MsgFlags, SockFlag, SockProtocol, SockType,
 };
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
-use nix::unistd::{execv, fork, ForkResult, Pid};
+use nix::unistd::Pid;
+use nix::unistd::{execv, fork, ForkResult};
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::fmt;
 use std::io::{Read, Write};
@@ -135,13 +141,14 @@ impl FileSystemSnapshot {
         })
     }
 
+    #[allow(clippy::map_entry)]
     fn snapshot_file(&mut self, filename: String) -> Result<(), Error> {
         if !self.files.contains_key(&filename) {
             let name = self.filenumber.to_string();
             self.filenumber += 1;
             let path = self.dir.path().join(name);
             if std::path::Path::new(&filename).exists() {
-                std::fs::copy(&filename, &path)?;
+                std::fs::copy(&filename, &path).expect("couldn't copy file");
                 self.files
                     .insert(filename, Some(path.to_str().unwrap().to_owned()));
             } else {
@@ -176,7 +183,7 @@ impl FileSystemSnapshot {
             }
         }
         for file in self.files_to_restore.iter() {
-            let snapshot = self.files.get(&file.clone()).unwrap();
+            let snapshot = &self.files[&file.clone()];
             trace!("Restoring {} from {:?}", file, snapshot);
             match snapshot {
                 Some(snapshot) => {

@@ -1,3 +1,5 @@
+#![warn(clippy::all)]
+
 extern crate clap;
 extern crate toml;
 
@@ -29,6 +31,7 @@ pub mod futex;
 pub mod oddity;
 pub mod ptrace_handlers;
 
+#[cfg(target_os = "linux")]
 pub fn majortom(config: config::Config) -> Result<(), failure::Error> {
     trace!("Running with config {:?}", config);
     let mut handlers = ptrace_handlers::Handlers::new(config.nodes);
@@ -36,6 +39,11 @@ pub fn majortom(config: config::Config) -> Result<(), failure::Error> {
     // set up oddity connection
     let mut oddity = oddity::OddityConnection::new(config.oddity, &mut handlers)?;
     oddity.run()?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn majortom(_config: config::Config) -> Result<(), failure::Error> {
     Ok(())
 }
 

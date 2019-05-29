@@ -3,6 +3,7 @@ use std::io::Write;
 
 use crate::config::OddityConfig;
 use crate::data::*;
+#[cfg(target_os = "linux")]
 use crate::ptrace_handlers::Handlers;
 use byteorder::{NetworkEndian, ReadBytesExt, WriteBytesExt};
 use failure::Error;
@@ -13,11 +14,13 @@ use serde_json as json;
 use serde_json::json;
 use std::net::TcpStream;
 
+#[cfg(target_os = "linux")]
 pub struct OddityConnection<'a> {
     connection: TcpStream,
     handlers: &'a mut Handlers,
 }
 
+#[cfg(target_os = "linux")]
 impl<'a> OddityConnection<'a> {
     pub fn new(config: OddityConfig, handlers: &'a mut Handlers) -> Result<Self, Error> {
         let address = config.address.unwrap_or(String::from("localhost:4343"));
