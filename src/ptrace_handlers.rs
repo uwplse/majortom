@@ -2,6 +2,7 @@
 #![allow(unused_imports)]
 
 use crate::clock::Clock;
+use crate::config::Config;
 use crate::futex::{
     Futex, FutexCmd, FutexWakeCmp, FutexWakeOp, FutexWakeOpArgs, FUTEX_BITSET_MATCH_ANY,
 };
@@ -22,12 +23,13 @@ use nix::sys::socket::{
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
 use nix::unistd::{execv, fork, ForkResult};
+use protojson::ProtobufToJson;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::fmt;
-use std::io::{Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::mem::size_of;
 use std::net::{TcpListener, TcpStream};
 use std::rc::Rc;
@@ -301,13 +303,14 @@ pub struct Handlers {
     timeout_waiting_procs: HashMap<TimeoutId, (TracedProcessIdentifier, Syscall)>,
     address_to_name: HashMap<SocketAddress, String>,
     tcp_channels: HashMap<(String, u64), TcpChannel>,
-    current_timeout: Option<data::Timeout>,
+    current_timeout: HashMap<TracedProcessIdentifier, data::Timeout>,
     current_message: Option<data::Message>,
     current_state: Option<serde_json::Value>,
     annotate_state_procs: HashMap<TracedProcessIdentifier, TracedProcessIdentifier>,
     current_tcp_message: Option<(SocketAddress, usize)>,
     // futex -> waiters (if any)
     futexes: HashMap<u64, VecDeque<(TracedProcessIdentifier, Syscall)>>,
+    protobuf_to_json: Option<ProtobufToJson>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1674,20 +1677,28 @@ enum HandleEpollResult {
 
 #[cfg(target_os = "linux")]
 impl Handlers {
-    pub fn new(nodes: HashMap<String, String>) -> Self {
+    pub fn new(config: &Config) -> Self {
+        let protobuf_to_json = match &config.system {
+            None => None,
+            Some(sc) => match &sc.protobufs {
+                None => None,
+                Some(path) => Some(ProtobufToJson::new(path).expect("failed to read protobufs")),
+            },
+        };
         Self {
-            nodes,
+            nodes: config.nodes.clone(),
             procs: HashMap::new(),
             message_waiting_procs: HashMap::new(),
             timeout_waiting_procs: HashMap::new(),
             annotate_state_procs: HashMap::new(),
             address_to_name: HashMap::new(),
             tcp_channels: HashMap::new(),
-            current_timeout: None,
+            current_timeout: HashMap::new(),
             current_message: None,
             current_state: None,
             current_tcp_message: None,
             futexes: HashMap::new(),
+            protobuf_to_json,
         }
     }
 
@@ -1697,10 +1708,10 @@ impl Handlers {
         res
     }
 
-    fn new_timeout(&mut self, ty: String) {
+    fn new_timeout(&mut self, procid: TracedProcessIdentifier, ty: String) {
         let mut timeout = data::Timeout::new();
         timeout.ty = ty;
-        self.current_timeout = Some(timeout);
+        self.current_timeout.insert(procid, timeout);
     }
 
     fn new_message(&mut self, ty: String) {
@@ -1709,8 +1720,11 @@ impl Handlers {
         self.current_message = Some(message);
     }
 
-    fn current_body(&mut self) -> Result<&mut serde_json::Value, Error> {
-        match self.current_timeout.as_mut() {
+    fn current_body(
+        &mut self,
+        procid: TracedProcessIdentifier,
+    ) -> Result<&mut serde_json::Value, Error> {
+        match self.current_timeout.get_mut(&procid) {
             Some(timeout) => return Ok(&mut timeout.body),
             None => (),
         }
@@ -1727,13 +1741,14 @@ impl Handlers {
 
     fn get_current_timeout(
         &mut self,
+        procid: TracedProcessIdentifier,
         node: String,
         timeout_id: TimeoutId,
         clock: Clock,
     ) -> data::Timeout {
         let mut timeout = self
             .current_timeout
-            .take()
+            .remove(&procid)
             .unwrap_or_else(|| data::Timeout::new());
         timeout.unique_id = serde_json::to_value(timeout_id.clone()).unwrap();
         timeout.to = node;
@@ -1913,9 +1928,36 @@ impl Handlers {
     }
 
     fn clear_timeout(&self, node: String, response: &mut data::Response, timeout_id: &TimeoutId) {
-        let mut t = data::Timeout::clear(serde_json::to_value(timeout_id).unwrap());
+        let tid = serde_json::to_value(timeout_id).unwrap();
+        // if we've set this timeout, we should clear it
+        response.timeouts.retain(|t| t.unique_id != tid);
+
+        // we might have set it before, so we should also tell Oddity to clear it
+        let mut t = data::Timeout::clear(tid);
         t.to = node;
         response.cleared_timeouts.push(t);
+    }
+
+    fn write_object_field(
+        &mut self,
+        procid: TracedProcessIdentifier,
+        path: &str,
+        v: serde_json::Value,
+    ) -> Result<(), Error> {
+        let mut obj = self.current_body(procid)?;
+        let mut fields: Vec<&str> = path.split(".").collect();
+        while let Some(field) = fields.pop() {
+            if !obj.is_object() {
+                *obj = json!({});
+            }
+            obj = obj
+                .as_object_mut()
+                .unwrap()
+                .entry(field)
+                .or_insert(json!({}));
+        }
+        *obj = v;
+        Ok(())
     }
 
     /// Fills the response from any non-blocking syscalls made by proc procid
@@ -2082,10 +2124,12 @@ impl Handlers {
                     self.timeout_waiting_procs
                         .insert(timeout_id.clone(), (procid.clone(), call.clone()));
                     let timeout = self.get_current_timeout(
+                        procid.clone(),
                         procid.name.clone(),
                         timeout_id.clone(),
                         clock.clone(),
                     );
+                    warn!("Setting timeout {:?} (nanosleep)", timeout);
                     response.timeouts.push(timeout);
                     // we're blocking, so we're done here
                 }
@@ -2100,10 +2144,12 @@ impl Handlers {
                             }
                             Arm(clock) => {
                                 let timeout = self.get_current_timeout(
+                                    procid.clone(),
                                     procid.name.clone(),
                                     timeout_id.clone(),
                                     clock.clone(),
                                 );
+                                warn!("Setting timeout {:?} (timerfd_settime)", timeout);
                                 response.timeouts.push(timeout);
                             }
                             Disarm => {
@@ -2246,12 +2292,14 @@ impl Handlers {
                         if let Some((timeout_id, clock)) = timeout {
                             // this is a timed wait, so we need to add a timeout to the response
                             let timeout = self.get_current_timeout(
+                                procid.clone(),
                                 procid.name.clone(),
                                 timeout_id.clone(),
                                 clock.clone(),
                             );
                             self.timeout_waiting_procs
                                 .insert(timeout_id.clone(), (procid.clone(), call.clone()));
+                            warn!("Setting timeout {:?} (futex wait)", timeout);
                             response.timeouts.push(timeout);
                         }
                     }
@@ -2527,7 +2575,7 @@ impl Handlers {
                             proc.stop_syscall()?;
                             proc.wake_from_stopped_call(call.clone())?;
                             self.send_tcp_message(response)?;
-                            self.new_timeout(ty);
+                            self.new_timeout(procid.clone(), ty);
                             stack.push(procid.clone());
                         }
                         2 => {
@@ -2556,21 +2604,7 @@ impl Handlers {
                             trace!("Process {} setting current.{} to {}", proc, path, value);
                             proc.stop_syscall()?;
                             proc.wake_from_stopped_call(call.clone())?;
-                            let mut obj = self
-                                .current_body()?
-                                .as_object_mut()
-                                .ok_or(format_err!("Bad json object"))?;
-                            let mut fields: Vec<&str> = path.rsplit(".").collect();
-                            while let Some(field) = fields.pop() {
-                                if fields.is_empty() {
-                                    obj.insert(field.to_string(), json!(value));
-                                } else {
-                                    if !obj.get(field).map_or(false, |x| x.is_object()) {
-                                        obj.insert(field.to_string(), json!({}));
-                                    }
-                                    obj = obj[field].as_object_mut().expect("Bad json object");
-                                }
-                            }
+                            self.write_object_field(procid.clone(), &path, json!(value))?;
                             stack.push(procid.clone());
                         }
                         11 => {
@@ -2581,22 +2615,49 @@ impl Handlers {
                             trace!("Process {} setting current.{} to {}", proc, path, value);
                             proc.stop_syscall()?;
                             proc.wake_from_stopped_call(call.clone())?;
-                            let mut obj = self
-                                .current_body()?
-                                .as_object_mut()
-                                .ok_or(format_err!("Bad json object"))?;
-                            let mut fields: Vec<&str> = path.rsplit(".").collect();
-                            while let Some(field) = fields.pop() {
-                                if fields.is_empty() {
-                                    obj.insert(field.to_string(), json!(value));
-                                } else {
-                                    if !obj.get(field).map_or(false, |x| x.is_object()) {
-                                        obj.insert(field.to_string(), json!({}));
-                                    }
-                                    obj = obj[field].as_object_mut().expect("Bad json object");
-                                }
-                            }
+                            self.write_object_field(procid.clone(), &path, json!(value))?;
                             stack.push(procid.clone());
+                        }
+                        12 => {
+                            // protobuf field
+                            let regs = proc.get_registers()?;
+                            let path = proc.read_string(regs.rdi)?;
+                            let mut message_type = proc.read_string(regs.rsi)?;
+                            // for some reason, protobuf wants message types prefixed with "."
+                            message_type.insert_str(0, ".");
+                            let protobuf_ptr = regs.rdx;
+                            let protobuf_len = regs.r10 as usize;
+                            let protobuf_data = proc.read_data(protobuf_ptr, protobuf_len)?;
+                            proc.stop_syscall()?;
+                            proc.wake_from_stopped_call(call.clone())?;
+                            if let Some(p_to_j) = &self.protobuf_to_json {
+                                let json = p_to_j.to_json(
+                                    &message_type,
+                                    &mut BufReader::new(&protobuf_data[..]),
+                                );
+                                match json {
+                                    Ok(json) => {
+                                        trace!(
+                                            "Process {} setting current.{} to {:?}",
+                                            proc,
+                                            path,
+                                            json
+                                        );
+                                        self.write_object_field(procid.clone(), &path, json)?;
+                                    }
+                                    Err(_e) => {
+                                        trace!("Error deserializing protobuf, skipping");
+                                        self.write_object_field(
+                                            procid.clone(),
+                                            &path,
+                                            json!("Protobuf error"),
+                                        )?;
+                                    }
+                                }
+                                stack.push(procid.clone());
+                            } else {
+                                bail!("No protobufs registered");
+                            }
                         }
                         _ => bail!("Bad upcall {}", n),
                     }

@@ -34,7 +34,7 @@ pub mod ptrace_handlers;
 #[cfg(target_os = "linux")]
 pub fn majortom(config: config::Config) -> Result<(), failure::Error> {
     trace!("Running with config {:?}", config);
-    let mut handlers = ptrace_handlers::Handlers::new(config.nodes);
+    let mut handlers = ptrace_handlers::Handlers::new(&config);
 
     // set up oddity connection
     let mut oddity = oddity::OddityConnection::new(config.oddity, &mut handlers)?;

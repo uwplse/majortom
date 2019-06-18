@@ -1,6 +1,9 @@
 [oddity]
 address="10.0.2.2:4343"
 
+[system]
+protobufs = "./logcabin-src/raft.pb"
+
 [nodes]
 node1="./logcabin-src/build/LogCabin --config logcabin-1.conf"
 node2="./logcabin-src/build/LogCabin --config logcabin-2.conf"

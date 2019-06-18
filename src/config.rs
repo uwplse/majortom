@@ -12,8 +12,14 @@ pub struct OddityConfig {
 }
 
 #[derive(Deserialize, Debug)]
+pub struct SystemConfig {
+    pub protobufs: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
 pub struct Config {
     pub oddity: OddityConfig,
+    pub system: Option<SystemConfig>,
     pub nodes: HashMap<String, String>,
 }
 
