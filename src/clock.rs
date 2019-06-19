@@ -18,6 +18,15 @@ impl Clock {
         }
     }
 
+    pub fn from_millis(ms: u32) -> Self {
+        let mut c = Self {
+            sec: (ms * 1000).into(),
+            nsec: 0,
+        };
+        c.normalize();
+        c
+    }
+
     pub fn to_timespec(&self) -> timespec {
         timespec {
             tv_sec: self.sec as i64,

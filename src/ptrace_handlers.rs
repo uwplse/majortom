@@ -349,6 +349,7 @@ enum Syscall {
     Stat,
     Fstat(i32, File),
     MMap(i32, Option<File>),
+    Pipe(u64), // address
     MUnmap,
     Close(i32, File),
     Read(i32, File, u64, usize),
@@ -377,6 +378,7 @@ enum Syscall {
     FutexCmpRequeue(u64, usize, u64, usize),
     FutexWakeOp(u64, usize, u64, usize, FutexWakeOpArgs),
     GetRLimit,
+    PRLimit64,
     Clone(CloneFlags),
     SigAltStack,
     SchedSetAffinity,
@@ -387,13 +389,16 @@ enum Syscall {
     Uname,
     GetSockName,
     GetPeerName,
+    GetPid,
     GetTid,
     SysInfo,
     ReadLink,
     SetITimer,
     GetTime,
+    GetTimeOfDay,
+    Time,
     IoCtl,
-    Fcntl(i32, FcntlCmd),
+    Fcntl(i32, File, FcntlCmd),
     Unlink(String),
     Symlink(String, String),
     Fsync,
@@ -411,7 +416,7 @@ enum Syscall {
     EpollCreate,
     // EpollFlags must be set if op is add or mod
     EpollCtl(i32, EpollOp, i32, Option<EpollFlags>, Option<u64>),
-    EpollWait(i32, u64, usize, i32),
+    EpollWait(i32, u64, usize, Option<(TimeoutId, Clock)>),
     Upcall(usize),
 }
 
@@ -764,7 +769,16 @@ impl TracedProcess {
                 let buf_ptr = regs.rsi as u64;
                 let count = regs.rdx as usize;
                 if let Some(file) = self.files.borrow().get(&fd) {
-                    Ok(Syscall::Read(fd, file.clone(), buf_ptr, count))
+                    if let File::TcpSocket(_) = file {
+                        Ok(Syscall::RecvFrom(
+                            fd,
+                            file.clone(),
+                            count,
+                            MsgFlags::empty(),
+                        ))
+                    } else {
+                        Ok(Syscall::Read(fd, file.clone(), buf_ptr, count))
+                    }
                 } else {
                     bail!("read() called on unknown file")
                 }
@@ -773,7 +787,12 @@ impl TracedProcess {
                 //write()
                 let fd = regs.rdi as i32;
                 if let Some(file) = self.files.borrow().get(&fd) {
-                    Ok(Syscall::Write(fd, file.clone()))
+                    if let File::TcpSocket(_) = file {
+                        let data = self.read_data(regs.rsi, regs.rdx as usize)?;
+                        Ok(Syscall::SendTo(fd, file.clone(), None, data))
+                    } else {
+                        Ok(Syscall::Write(fd, file.clone()))
+                    }
                 } else {
                     bail!("write() called on unknown file")
                 }
@@ -838,11 +857,15 @@ impl TracedProcess {
                     bail!("writev() called on unknown file")
                 }
             }
-
             21 => {
                 // access()
                 let s = self.read_string(regs.rdi)?;
                 Ok(Syscall::Access(s))
+            }
+            22 => {
+                // pipe()
+                let addr = regs.rdi as u64;
+                Ok(Syscall::Pipe(addr))
             }
             24 => Ok(Syscall::SchedYield),
             26 => Ok(Syscall::MSync),
@@ -873,6 +896,7 @@ impl TracedProcess {
                     bail!("Unsupported ITimer {}", which);
                 }
             }
+            39 => Ok(Syscall::GetPid),
             41 => {
                 // socket()
                 let socket_family = regs.rdi as i32;
@@ -1037,16 +1061,20 @@ impl TracedProcess {
                 let fd = regs.rdi as i32;
                 let cmd = regs.rsi as i32;
                 let arg = regs.rdx as u64;
-                let inner = match cmd {
-                    libc::F_GETFL => GetFl,
-                    libc::F_SETFD => SetFd,
-                    libc::F_SETFL => {
-                        let opt = OFlag::from_bits(arg as i32).unwrap();
-                        SetFl(opt)
-                    }
-                    _ => bail!("Bad fcntl {}", cmd),
-                };
-                Ok(Syscall::Fcntl(fd, inner))
+                if let Some(file) = self.files.borrow().get(&fd).clone() {
+                    let inner = match cmd {
+                        libc::F_GETFL => GetFl,
+                        libc::F_SETFD => SetFd,
+                        libc::F_SETFL => {
+                            let opt = OFlag::from_bits(arg as i32).unwrap();
+                            SetFl(opt)
+                        }
+                        _ => bail!("Bad fcntl {}", cmd),
+                    };
+                    Ok(Syscall::Fcntl(fd, file.clone(), inner))
+                } else {
+                    bail!("fcntl() called on bad file");
+                }
             }
             73 => Ok(Syscall::FLock),
             74 => Ok(Syscall::Fsync),
@@ -1077,6 +1105,7 @@ impl TracedProcess {
                 // readlink()
                 Ok(Syscall::ReadLink)
             }
+            96 => Ok(Syscall::GetTimeOfDay),
             97 => Ok(Syscall::GetRLimit),
             99 => {
                 // sysinfo()
@@ -1085,6 +1114,11 @@ impl TracedProcess {
             131 => Ok(Syscall::SigAltStack),
             158 => Ok(Syscall::ArchPrctl),
             186 => Ok(Syscall::GetTid),
+            201 => {
+                // time
+                Ok(Syscall::Time)
+            }
+
             // Futexes!
             202 => {
                 let word = regs.rdi as u64;
@@ -1181,6 +1215,7 @@ impl TracedProcess {
             }
             203 => Ok(Syscall::SchedSetAffinity),
             204 => Ok(Syscall::SchedGetAffinity),
+            213 => Ok(Syscall::EpollCreate),
             228 => {
                 // clock_gettime
                 // For now, we're just going to let these go through.
@@ -1205,7 +1240,14 @@ impl TracedProcess {
                 let epfd = regs.rdi as i32;
                 let events_ptr = regs.rsi as u64;
                 let max_events = regs.rdx as usize;
-                let timeout = regs.r10 as i32;
+                let timeout_millis = regs.r10 as i32;
+                let timeout = if timeout_millis > -1 {
+                    let clock = Clock::from_millis(timeout_millis as u32);
+                    let timeout_id = self.next_timeout_id();
+                    Some((timeout_id, clock))
+                } else {
+                    None
+                };
                 Ok(Syscall::EpollWait(epfd, events_ptr, max_events, timeout))
             }
             233 => {
@@ -1238,10 +1280,14 @@ impl TracedProcess {
                 let path = {
                     let relative = self.read_string(regs.rsi)?;
                     let mut path = std::path::PathBuf::new();
-                    match self.files.borrow().get(&fd) {
-                        Some(File::ReadFile(dirpath)) => path.push(dirpath.clone()),
-                        file => bail!("mkdirat called on bad file {:?}", file),
-                    };
+                    if fd != libc::AT_FDCWD && !relative.starts_with("/") {
+                        match self.files.borrow().get(&fd) {
+                            Some(File::ReadFile(dirpath)) => path.push(dirpath.clone()),
+                            file => {
+                                bail!("openat called on bad file {:?} and path {}", file, relative)
+                            }
+                        };
+                    }
                     path.push(relative);
                     path.to_str().unwrap().to_string()
                 };
@@ -1259,10 +1305,16 @@ impl TracedProcess {
                 let path = {
                     let relative = self.read_string(regs.rsi)?;
                     let mut path = std::path::PathBuf::new();
-                    match self.files.borrow().get(&fd) {
-                        Some(File::ReadFile(dirpath)) => path.push(dirpath.clone()),
-                        file => bail!("mkdirat called on bad file {:?}", file),
-                    };
+                    if fd != libc::AT_FDCWD && !relative.starts_with("/") {
+                        match self.files.borrow().get(&fd) {
+                            Some(File::ReadFile(dirpath)) => path.push(dirpath.clone()),
+                            file => bail!(
+                                "mkdirat called on bad file {:?} and path {}",
+                                file,
+                                relative
+                            ),
+                        };
+                    }
                     path.push(relative);
                     path.to_str().unwrap().to_string()
                 };
@@ -1326,6 +1378,7 @@ impl TracedProcess {
                 // epoll_create1
                 Ok(Syscall::EpollCreate) // ignore flags for now
             }
+            302 => Ok(Syscall::PRLimit64),
             // upcalls from application
             x if x >= 5000 => Ok(Syscall::Upcall((x - 5000) as usize)),
             _ => bail!(
@@ -1371,6 +1424,11 @@ impl TracedProcess {
                 }
                 let file = self.files.borrow().get(&fd1).unwrap().clone();
                 self.files.borrow_mut().insert(fd2, file);
+            }
+            (Syscall::Pipe(addr), SyscallReturn::Success(_)) => {
+                let fds: [i32; 2] = unsafe { self.read(addr)? };
+                self.files.borrow_mut().insert(fds[0], File::Special);
+                self.files.borrow_mut().insert(fds[1], File::Special);
             }
             (Syscall::Close(fd, _), SyscallReturn::Success(_)) => {
                 trace!("Removing file {} from proc {:?}", fd, self);
@@ -1575,7 +1633,7 @@ impl TracedProcess {
         let regs = self.get_registers()?;
         let sys_ret = regs.rax as i64;
         if sys_ret < 0 {
-            bail!("accept() failed");
+            bail!("accept() failed: {}", sys_ret);
         }
         let fd = sys_ret as i32;
         self.files
@@ -1622,6 +1680,16 @@ impl TracedProcess {
         Ok(())
     }
 
+    fn epoll_timedout(&mut self) -> Result<(), Error> {
+        self.run_until_syscall()?;
+        self.wait_on_syscall()?;
+
+        let mut regs = self.get_registers()?;
+        regs.rax = 0 as u64;
+        self.set_registers(regs)?;
+        Ok(())
+    }
+
     fn epoll_return(&mut self, event_ptr: u64, data: u64, event: u32) -> Result<(), Error> {
         self.run_until_syscall()?;
         self.wait_on_syscall()?;
@@ -1642,6 +1710,40 @@ impl TracedProcess {
         Ok(())
     }
 
+    fn time_return(&mut self) -> Result<(), Error> {
+        let sec = self.clock.borrow().to_timespec().tv_sec;
+        self.stop_syscall()?;
+        self.run_until_syscall()?;
+        self.wait_on_syscall()?;
+        let mut regs = self.get_registers()?;
+        regs.rax = sec as u64;
+        let time_t_ptr = regs.rdi;
+        if time_t_ptr != 0 {
+            unsafe {
+                self.write(time_t_ptr, sec as libc::time_t)?;
+            }
+        }
+        self.set_registers(regs)?;
+        Ok(())
+    }
+
+    fn gettimeofday_return(&mut self) -> Result<(), Error> {
+        let time = self.clock.borrow().to_timespec();
+        self.stop_syscall()?;
+        self.run_until_syscall()?;
+        self.wait_on_syscall()?;
+        let mut regs = self.get_registers()?;
+        regs.rax = 0;
+        let timespec_ptr = regs.rdi;
+        if timespec_ptr != 0 {
+            unsafe {
+                self.write(timespec_ptr, time)?;
+            }
+        }
+        self.set_registers(regs)?;
+        Ok(())
+    }
+
     fn gettime_return(&mut self) -> Result<(), Error> {
         let time = self.clock.borrow().to_timespec();
         self.stop_syscall()?;
@@ -1650,8 +1752,10 @@ impl TracedProcess {
         let mut regs = self.get_registers()?;
         regs.rax = 0;
         let timespec_ptr = regs.rsi;
-        unsafe {
-            self.write(timespec_ptr, time)?;
+        if timespec_ptr != 0 {
+            unsafe {
+                self.write(timespec_ptr, time)?;
+            }
         }
         self.set_registers(regs)?;
         Ok(())
@@ -1662,6 +1766,7 @@ impl TracedProcess {
 enum HandleEpollReason {
     Message(SocketAddress),
     Timeout(TimeoutId),
+    InitialWait,
     JustChecking,
 }
 
@@ -1672,6 +1777,7 @@ enum HandleEpollWait {
 
 enum HandleEpollResult {
     Return(u64, u64, u32),
+    TimedOut,
     ContinueWaiting,
 }
 
@@ -1800,10 +1906,20 @@ impl Handlers {
         procid: TracedProcessIdentifier,
         call: Syscall,
         reason: HandleEpollReason,
+        response: &mut data::Response,
     ) -> Result<HandleEpollResult, Error> {
-        if let Syscall::EpollWait(epfd, events_ptr, _, _) = call {
+        if let Syscall::EpollWait(epfd, events_ptr, _, timeout) = call.clone() {
             let mut return_entry: Option<(i32, EpollFlags, u64)> = None;
             let mut waits: Vec<HandleEpollWait> = Vec::new();
+            if let Some((timeout_id, _clock)) = timeout.clone() {
+                waits.push(HandleEpollWait::Timeout(timeout_id.clone()));
+                if let HandleEpollReason::Timeout(ref id) = reason {
+                    if timeout_id == id.clone() {
+                        // really horrid hack, here
+                        return_entry = Some((-1, EpollFlags::empty(), 0));
+                    }
+                }
+            }
             let proc = self
                 .procs
                 .get_mut(&procid)
@@ -1855,6 +1971,7 @@ impl Handlers {
                                     }
                                 }
                                 SignalFd => (),
+                                Special => (),
                                 f => bail!("Bad file {:?} in epoll", f),
                             }
                         }
@@ -1869,17 +1986,20 @@ impl Handlers {
                     // 1. set "waiting" to None
                     // 2. if flags & EPOLLONESHOT, remove the fd from the list
                     // 3. stop waiting on all of these fds
-                    let mut all_files = proc.files.borrow_mut();
-                    let epoll_file = all_files.get_mut(&epfd).unwrap();
-                    match epoll_file {
-                        File::EpollFd(fds, waiting) => {
-                            waiting.replace(None);
-                            if flags.intersects(EpollFlags::EPOLLONESHOT) {
-                                let index = fds.iter().position(|e| e.0 == fd).unwrap();
-                                fds.remove(index);
+                    // 4. clear the call's timeout, if there is one
+                    {
+                        let mut all_files = proc.files.borrow_mut();
+                        let epoll_file = all_files.get_mut(&epfd).unwrap();
+                        match epoll_file {
+                            File::EpollFd(fds, waiting) => {
+                                waiting.replace(None);
+                                if flags.intersects(EpollFlags::EPOLLONESHOT) {
+                                    let index = fds.iter().position(|e| e.0 == fd).unwrap();
+                                    fds.remove(index);
+                                }
                             }
+                            _ => bail!("bad epoll"),
                         }
-                        _ => bail!("bad epoll"),
                     }
                     for wait in waits {
                         match wait {
@@ -1891,21 +2011,30 @@ impl Handlers {
                             }
                         }
                     }
-                    Ok(HandleEpollResult::Return(
-                        events_ptr,
-                        data,
-                        flags.bits() as u32,
-                    ))
+                    if let Some((timeout_id, _clock)) = timeout {
+                        self.clear_timeout(procid.name.clone(), response, &timeout_id)
+                    }
+                    if fd < 1 {
+                        Ok(HandleEpollResult::TimedOut)
+                    } else {
+                        Ok(HandleEpollResult::Return(
+                            events_ptr,
+                            data,
+                            flags.bits() as u32,
+                        ))
+                    }
                 }
                 None => {
                     // we're going to return, but we need to record that we are waiting
-                    let mut all_files = proc.files.borrow_mut();
-                    let epoll_file = all_files.get_mut(&epfd).unwrap();
-                    match epoll_file {
-                        File::EpollFd(_fds, waiting) => {
-                            waiting.replace(Some((procid.clone(), call.clone())));
+                    {
+                        let mut all_files = proc.files.borrow_mut();
+                        let epoll_file = all_files.get_mut(&epfd).unwrap();
+                        match epoll_file {
+                            File::EpollFd(_fds, waiting) => {
+                                waiting.replace(Some((procid.clone(), call.clone())));
+                            }
+                            _ => bail!("bad epoll"),
                         }
-                        _ => bail!("bad epoll"),
                     }
                     for wait in waits {
                         match wait {
@@ -1917,6 +2046,21 @@ impl Handlers {
                                 self.timeout_waiting_procs
                                     .insert(timeout_id.clone(), (procid.clone(), call.clone()));
                             }
+                        }
+                    }
+                    if let Some((timeout_id, clock)) = timeout {
+                        match reason {
+                            HandleEpollReason::InitialWait => {
+                                let timeout = self.get_current_timeout(
+                                    procid.clone(),
+                                    procid.name.clone(),
+                                    timeout_id,
+                                    clock,
+                                );
+                                warn!("Setting timeout {:?} (epoll wait)", timeout);
+                                response.timeouts.push(timeout);
+                            }
+                            _ => (),
                         }
                     }
                     Ok(HandleEpollResult::ContinueWaiting)
@@ -2022,6 +2166,10 @@ impl Handlers {
                 Syscall::SetSockOpt(_, level, opt) => match (*level, *opt) {
                     (libc::SOL_SOCKET, libc::SO_REUSEADDR) => (),
                     (libc::IPPROTO_TCP, libc::TCP_NODELAY) => (),
+                    (libc::SOL_SOCKET, libc::SO_KEEPALIVE) => (),
+                    (libc::IPPROTO_TCP, libc::TCP_KEEPIDLE) => (),
+                    (libc::IPPROTO_TCP, libc::TCP_KEEPINTVL) => (),
+                    (libc::IPPROTO_TCP, libc::TCP_KEEPCNT) => (),
                     _ => bail!("Unsupported setsockopt: {}/{}", level, opt),
                 },
                 _ => (),
@@ -2483,16 +2631,15 @@ impl Handlers {
                         }
                     }
                 }
-                Syscall::EpollWait(_epfd, _events_ptr, _max_events, timeout) => {
+                Syscall::EpollWait(_epfd, _events_ptr, _max_events, _timeout) => {
                     use HandleEpollReason::*;
                     use HandleEpollResult::*;
                     proc.stop_syscall()?;
-                    if *timeout != -1 {
-                        bail!("epoll_wait() timeouts not yet supported");
-                    }
-                    let res = self.handle_epoll(procid.clone(), call.clone(), JustChecking)?;
+                    let res =
+                        self.handle_epoll(procid.clone(), call.clone(), InitialWait, response)?;
                     match res {
                         ContinueWaiting => (),
+                        TimedOut => bail!("timed out immediately, which shouldn't happen"),
                         Return(event_ptr, data, why) => {
                             // epoll_wait should return immediately
                             let proc = self
@@ -2530,6 +2677,7 @@ impl Handlers {
                                 procid.clone(),
                                 call.clone(),
                                 HandleEpollReason::JustChecking,
+                                response,
                             )?;
                             match ret {
                                 HandleEpollResult::Return(events_ptr, data, why) => {
@@ -2542,13 +2690,18 @@ impl Handlers {
                                     waiter.epoll_return(events_ptr, data, why)?;
                                     stack.push(procid.clone());
                                 }
+                                HandleEpollResult::TimedOut => {
+                                    bail!("Epoll timed out on epollctl--impossible");
+                                }
                                 HandleEpollResult::ContinueWaiting => (),
                             }
                         }
                     }
                 }
                 // we want to block attempts to make things non-blocking
-                Syscall::Fcntl(_, FcntlCmd::SetFl(OFlag::O_NONBLOCK)) => {
+                Syscall::Fcntl(_, file, FcntlCmd::SetFl(flags))
+                    if !file.is_special() && flags.intersects(OFlag::O_NONBLOCK) =>
+                {
                     trace!("Stopping attempt to make something non-blocking");
                     proc.stop_syscall()?;
                     proc.wake_from_stopped_call(call)?;
@@ -2557,6 +2710,16 @@ impl Handlers {
                 Syscall::GetTime => {
                     trace!("GetTime called; lying about the time");
                     proc.gettime_return()?;
+                    stack.push(procid.clone());
+                }
+                Syscall::GetTimeOfDay => {
+                    trace!("GetTimeOfDay called; lying about the time");
+                    proc.gettimeofday_return()?;
+                    stack.push(procid.clone());
+                }
+                Syscall::Time => {
+                    trace!("Time called; lying about the time");
+                    proc.time_return()?;
                     stack.push(procid.clone());
                 }
                 Syscall::Upcall(n) => {
@@ -2786,6 +2949,7 @@ impl Handlers {
                             procid.clone(),
                             call.clone(),
                             HandleEpollReason::Message(wire_message.to.clone()),
+                            response,
                         )?;
                         if let HandleEpollResult::Return(events_ptr, data, why) = ret {
                             let proc = self.procs.get_mut(&procid.clone()).expect("Bad procid");
@@ -3005,15 +3169,24 @@ impl Handlers {
                         procid.clone(),
                         call.clone(),
                         HandleEpollReason::Timeout(timeout_id.clone()),
+                        response,
                     )?;
-                    if let HandleEpollResult::Return(events_ptr, data, why) = ret {
-                        let proc = self.procs.get_mut(&procid.clone()).expect("Bad procid");
-                        proc.clock.borrow_mut().ensure_gt(&wire_timeout.clock);
-                        proc.epoll_return(events_ptr, data, why)?;
-                        let procid = procid.clone();
-                        self.fill_response(procid, response)?;
-                    } else {
-                        bail!("delivered epoll message, failed to wake");
+                    match ret {
+                        HandleEpollResult::Return(events_ptr, data, why) => {
+                            let proc = self.procs.get_mut(&procid.clone()).expect("Bad procid");
+                            proc.clock.borrow_mut().ensure_gt(&wire_timeout.clock);
+                            proc.epoll_return(events_ptr, data, why)?;
+                            let procid = procid.clone();
+                            self.fill_response(procid, response)?;
+                        }
+                        HandleEpollResult::TimedOut => {
+                            let proc = self.procs.get_mut(&procid.clone()).expect("Bad procid");
+                            proc.clock.borrow_mut().ensure_gt(&wire_timeout.clock);
+                            proc.epoll_timedout()?;
+                            let procid = procid.clone();
+                            self.fill_response(procid, response)?;
+                        }
+                        _ => bail!("delivered epoll message, failed to wake"),
                     }
                 }
                 Syscall::FutexWait(futex, _, _, _) => {
