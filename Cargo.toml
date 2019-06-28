@@ -21,6 +21,7 @@ bincode = "1.1.2"
 tempfile = "3.0.7"
 base64 = "0.10.1"
 base64-serde = "0.3.2"
+rand = "0.6"
 protojson = { git = "https://github.com/dwoos/protojson" }
 
 [dependencies.libc]

@@ -1,9 +1,16 @@
-use libc::timespec;
+use libc::{timespec, timeval};
+use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub struct Clock {
     sec: u64,
     nsec: u64,
+}
+
+impl fmt::Display for Clock {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}:{}", self.sec, self.nsec)
+    }
 }
 
 impl Clock {
@@ -20,11 +27,24 @@ impl Clock {
 
     pub fn from_millis(ms: u32) -> Self {
         let mut c = Self {
-            sec: (ms * 1000).into(),
-            nsec: 0,
+            sec: (ms / 1000).into(),
+            nsec: ((ms % 1000) * 1_000_000).into(),
         };
         c.normalize();
         c
+    }
+
+    pub fn to_timeval(&self) -> timeval {
+        #[cfg(target_os = "linux")]
+        return timeval {
+            tv_sec: self.sec as i64,
+            tv_usec: (self.nsec / 1000) as i64,
+        };
+        #[cfg(not(target_os = "linux"))]
+        return timeval {
+            tv_sec: self.sec as i64,
+            tv_usec: (self.nsec / 1000) as i32,
+        };
     }
 
     pub fn to_timespec(&self) -> timespec {

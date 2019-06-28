@@ -24,6 +24,7 @@ use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
 use nix::unistd::{execv, fork, ForkResult};
 use protojson::ProtobufToJson;
+use rand::prelude::*;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::collections::{HashMap, HashSet};
@@ -43,7 +44,7 @@ use crate::data;
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone, PartialEq)]
 enum File {
-    TcpSocket(Option<SocketAddress>),
+    TcpSocket(Option<SocketAddress>, bool),
     UDPSocket(Option<SocketAddress>),
     EpollFd(
         Vec<(i32, EpollFlags, u64)>,
@@ -216,6 +217,7 @@ struct TracedProcess {
     snapshot: Rc<RefCell<FileSystemSnapshot>>,
     counter: Rc<RefCell<u64>>,
     clock: Rc<RefCell<Clock>>,
+    random: Rc<RefCell<StdRng>>,
 }
 
 #[cfg(target_os = "linux")]
@@ -280,7 +282,7 @@ impl TimeoutId {
 
 #[derive(PartialEq, Serialize, Deserialize, Debug, Clone)]
 enum MessageData {
-    TcpConnect(u64),
+    TcpConnect(String, u64),
     TcpAck(String),
     #[serde(with = "Base64Standard")]
     Data(Vec<u8>),
@@ -300,6 +302,7 @@ pub struct Handlers {
     nodes: HashMap<String, String>,
     procs: HashMap<TracedProcessIdentifier, TracedProcess>,
     message_waiting_procs: HashMap<SocketAddress, (TracedProcessIdentifier, Syscall)>,
+    messages: HashMap<SocketAddress, VecDeque<WireMessage>>,
     timeout_waiting_procs: HashMap<TimeoutId, (TracedProcessIdentifier, Syscall)>,
     address_to_name: HashMap<SocketAddress, String>,
     tcp_channels: HashMap<(String, u64), TcpChannel>,
@@ -367,6 +370,7 @@ enum Syscall {
     SigAction,
     NanoSleep(TimeoutId, Clock),
     SendTo(i32, File, Option<SocketAddress>, Vec<u8>),
+    TcpSendTo(i32, File, Option<SocketAddress>, usize),
     SendMsg(i32, File),
     SetTidAddress,
     SetRobustList,
@@ -378,6 +382,7 @@ enum Syscall {
     FutexCmpRequeue(u64, usize, u64, usize),
     FutexWakeOp(u64, usize, u64, usize, FutexWakeOpArgs),
     GetRLimit,
+    GetRUsage,
     PRLimit64,
     Clone(CloneFlags),
     SigAltStack,
@@ -448,6 +453,10 @@ impl TracedProcess {
         let proc = match fork()? {
             ForkResult::Parent { child, .. } => {
                 trace!("Started child with pid {}", child);
+                let mut random_seed: [u8; 32] = [0; 32];
+                for (i, byte) in program.as_bytes().iter().enumerate() {
+                    random_seed[i % 32] = *byte;
+                }
                 Self {
                     name: name,
                     tgid: child,
@@ -456,6 +465,7 @@ impl TracedProcess {
                     counter: Rc::new(RefCell::new(0)),
                     snapshot: Rc::new(RefCell::new(FileSystemSnapshot::new()?)),
                     clock: Rc::new(RefCell::new(Clock::new())),
+                    random: Rc::new(RefCell::new(rand::rngs::StdRng::from_seed(random_seed))),
                 }
             }
             ForkResult::Child => {
@@ -551,6 +561,7 @@ impl TracedProcess {
             counter: Rc::clone(&self.counter),
             snapshot: Rc::clone(&self.snapshot),
             clock: Rc::clone(&self.clock),
+            random: Rc::clone(&self.random),
         };
         proc.wait_for_process_start()?;
         Ok((child, proc))
@@ -596,17 +607,16 @@ impl TracedProcess {
                 // architecture*.
                 let raw = ptrace::read(self.tid, (addr + (i as u64)) as ptrace::AddressType)?;
                 buf = raw.to_ne_bytes();
-                trace!(
+                /*trace!(
                     "Read {:?} ({:?}) from process memory at {:?}",
                     buf,
                     raw,
                     addr
-                );
+                );*/
             }
             bytes.push(buf[i % size_of::<libc::c_long>()]);
             // addr incremented once for each *byte* read
         }
-        trace!("read bytes {:?}", bytes);
         Ok(bytes)
     }
 
@@ -671,9 +681,8 @@ impl TracedProcess {
             length,
             addr
         );
-        trace!("Writing {:?}", data);
         for (i, b) in data.iter().enumerate() {
-            if i % size_of::<libc::c_long>() == 0 {
+            if i % size_of::<libc::c_long>() == 0 && i + size_of::<libc::c_long>() > length {
                 // read the current value of this word from process memory so we
                 // don't overwrite things we shouldn't
                 let index = (i / size_of::<libc::c_long>()) * size_of::<libc::c_long>();
@@ -689,19 +698,13 @@ impl TracedProcess {
             if ((i + 1) % size_of::<libc::c_long>() == 0) || i + 1 == length {
                 let index = (i / size_of::<libc::c_long>()) * size_of::<libc::c_long>();
                 let addr = addr + (index as u64);
-                if (i + 1) % size_of::<libc::c_long>() != 0 {
-                    // we're about to write a whole word, when we actually
-                    // only want to write the contents of a prefix of that
-                    // word. let's not!
-
-                }
                 let word = u64::from_ne_bytes(buf);
-                trace!(
+                /*trace!(
                     "Writing {:?} ({:?}) to process memory at {:?}",
                     buf,
                     word,
                     addr
-                );
+                );*/
                 ptrace::write(
                     self.tid,
                     addr as ptrace::AddressType,
@@ -769,7 +772,7 @@ impl TracedProcess {
                 let buf_ptr = regs.rsi as u64;
                 let count = regs.rdx as usize;
                 if let Some(file) = self.files.borrow().get(&fd) {
-                    if let File::TcpSocket(_) = file {
+                    if let File::TcpSocket(_, _) = file {
                         Ok(Syscall::RecvFrom(
                             fd,
                             file.clone(),
@@ -787,9 +790,13 @@ impl TracedProcess {
                 //write()
                 let fd = regs.rdi as i32;
                 if let Some(file) = self.files.borrow().get(&fd) {
-                    if let File::TcpSocket(_) = file {
-                        let data = self.read_data(regs.rsi, regs.rdx as usize)?;
-                        Ok(Syscall::SendTo(fd, file.clone(), None, data))
+                    if let File::TcpSocket(_, _) = file {
+                        Ok(Syscall::TcpSendTo(
+                            fd,
+                            file.clone(),
+                            None,
+                            regs.rdx as usize,
+                        ))
                     } else {
                         Ok(Syscall::Write(fd, file.clone()))
                     }
@@ -945,7 +952,7 @@ impl TracedProcess {
                 let fd = regs.rdi as i32;
                 if let Some(sock) = self.files.borrow().get(&fd) {
                     match sock {
-                        File::TcpSocket(_) => {
+                        File::TcpSocket(_, _) => {
                             let socket_address =
                                 self.read_socket_address(regs.rsi, regs.rdx as usize)?;
                             Ok(Syscall::Connect(fd, sock.clone(), socket_address))
@@ -978,8 +985,17 @@ impl TracedProcess {
                         } else {
                             None
                         };
-                        let data = self.read_data(regs.rsi, regs.rdx as usize)?;
-                        Ok(Syscall::SendTo(fd, sock.clone(), socket_address, data))
+                        if let Some(File::TcpSocket(_, _)) = self.files.borrow().get(&fd) {
+                            Ok(Syscall::TcpSendTo(
+                                fd,
+                                sock.clone(),
+                                socket_address,
+                                regs.rdx as usize,
+                            ))
+                        } else {
+                            let data = self.read_data(regs.rsi, regs.rdx as usize)?;
+                            Ok(Syscall::SendTo(fd, sock.clone(), socket_address, data))
+                        }
                     }
                 } else {
                     bail!("sendto() called on unknown file")
@@ -1107,6 +1123,7 @@ impl TracedProcess {
             }
             96 => Ok(Syscall::GetTimeOfDay),
             97 => Ok(Syscall::GetRLimit),
+            98 => Ok(Syscall::GetRUsage),
             99 => {
                 // sysinfo()
                 Ok(Syscall::SysInfo)
@@ -1242,7 +1259,9 @@ impl TracedProcess {
                 let max_events = regs.rdx as usize;
                 let timeout_millis = regs.r10 as i32;
                 let timeout = if timeout_millis > -1 {
-                    let clock = Clock::from_millis(timeout_millis as u32);
+                    let mut clock = Clock::from_millis(timeout_millis as u32);
+                    // this is a relative time
+                    clock.advance(&self.clock.borrow());
                     let timeout_id = self.next_timeout_id();
                     Some((timeout_id, clock))
                 } else {
@@ -1462,7 +1481,7 @@ impl TracedProcess {
             }
             (Syscall::TcpSocket, SyscallReturn::Success(fd)) => {
                 let fd = fd as i32;
-                let file = File::TcpSocket(None);
+                let file = File::TcpSocket(None, false);
                 self.files.borrow_mut().insert(fd, file);
             }
             (Syscall::Bind(fd, addr), SyscallReturn::Success(_)) => {
@@ -1472,7 +1491,7 @@ impl TracedProcess {
                     Some(File::UDPSocket(v)) => {
                         *v = Some(addr);
                     }
-                    Some(File::TcpSocket(v)) => {
+                    Some(File::TcpSocket(v, _)) => {
                         *v = Some(addr);
                     }
                     _ => {
@@ -1556,6 +1575,7 @@ impl TracedProcess {
         let mut regs = self.get_registers()?;
         regs.rax = match call {
             Syscall::SendTo(_, _, _, data) => data.len() as u64,
+            Syscall::TcpSendTo(_, _, _, count) => count as u64,
             Syscall::Upcall(_) => 42 as u64,
             _ => 0,
         };
@@ -1638,7 +1658,7 @@ impl TracedProcess {
         let fd = sys_ret as i32;
         self.files
             .borrow_mut()
-            .insert(fd, File::TcpSocket(Some(local_addr)));
+            .insert(fd, File::TcpSocket(Some(local_addr), false));
         if addr_ptr != 0 {
             self.write_socket_address(addr_ptr, addr_len, addr)?;
         }
@@ -1674,9 +1694,11 @@ impl TracedProcess {
         if sys_ret < 0 {
             bail!("connect() failed: {}", sys_ret);
         }
-        self.files
-            .borrow_mut()
-            .insert(fd, File::TcpSocket(Some(addr)));
+        let mut all_files = self.files.borrow_mut();
+        let sock = all_files.get_mut(&fd);
+        if let Some(File::TcpSocket(ref mut sockaddr, _)) = sock {
+            *sockaddr = Some(addr);
+        }
         Ok(())
     }
 
@@ -1711,7 +1733,12 @@ impl TracedProcess {
     }
 
     fn time_return(&mut self) -> Result<(), Error> {
-        let sec = self.clock.borrow().to_timespec().tv_sec;
+        let sec = {
+            let clock = self.clock.borrow();
+            trace!("Time is {}", clock);
+            let sec = clock.to_timespec().tv_sec;
+            sec
+        };
         self.stop_syscall()?;
         self.run_until_syscall()?;
         self.wait_on_syscall()?;
@@ -1728,16 +1755,21 @@ impl TracedProcess {
     }
 
     fn gettimeofday_return(&mut self) -> Result<(), Error> {
-        let time = self.clock.borrow().to_timespec();
+        let time = {
+            let clock = self.clock.borrow();
+            trace!("Time is {}", clock);
+            let time = clock.to_timeval();
+            time
+        };
         self.stop_syscall()?;
         self.run_until_syscall()?;
         self.wait_on_syscall()?;
         let mut regs = self.get_registers()?;
         regs.rax = 0;
-        let timespec_ptr = regs.rdi;
-        if timespec_ptr != 0 {
+        let timeval_ptr = regs.rdi;
+        if timeval_ptr != 0 {
             unsafe {
-                self.write(timespec_ptr, time)?;
+                self.write(timeval_ptr, time)?;
             }
         }
         self.set_registers(regs)?;
@@ -1745,7 +1777,12 @@ impl TracedProcess {
     }
 
     fn gettime_return(&mut self) -> Result<(), Error> {
-        let time = self.clock.borrow().to_timespec();
+        let time = {
+            let clock = self.clock.borrow();
+            trace!("Time is {}", clock);
+            let time = clock.to_timespec();
+            time
+        };
         self.stop_syscall()?;
         self.run_until_syscall()?;
         self.wait_on_syscall()?;
@@ -1795,6 +1832,7 @@ impl Handlers {
             nodes: config.nodes.clone(),
             procs: HashMap::new(),
             message_waiting_procs: HashMap::new(),
+            messages: HashMap::new(),
             timeout_waiting_procs: HashMap::new(),
             annotate_state_procs: HashMap::new(),
             address_to_name: HashMap::new(),
@@ -1901,6 +1939,186 @@ impl Handlers {
         Ok(())
     }
 
+    fn has_message(&self, addr: &SocketAddress) -> bool {
+        self.messages.get(addr).map_or(false, |v| !v.is_empty())
+    }
+
+    fn pop_message(&mut self, addr: &SocketAddress) -> Option<WireMessage> {
+        self.messages.get_mut(addr).map_or(None, |v| v.pop_front())
+    }
+
+    fn push_message(&mut self, addr: SocketAddress, message: WireMessage) {
+        self.messages
+            .entry(addr)
+            .or_insert_with(|| VecDeque::new())
+            .push_back(message);
+    }
+
+    fn accept_handle_message(
+        &mut self,
+        procid: &TracedProcessIdentifier,
+        _call: &Syscall,
+        wire_message: &WireMessage,
+        response: &mut data::Response,
+    ) -> Result<(), Error> {
+        match &wire_message.data {
+            MessageData::TcpConnect(from, ref remote_counter) => {
+                let proc = self.procs.get_mut(&procid.clone()).expect("Bad procid");
+                if let SocketAddress::IPV4(port) = wire_message.to {
+                    // start accepting, but don't wait for syscall to return
+                    let (addr_ptr, addr_len) = proc.accept_continue()?;
+                    // this call should return immediately, since proc is accepting
+                    let local = TcpStream::connect(("localhost", port)).unwrap();
+                    let counter = proc.next_counter();
+                    let channel = {
+                        let remote_channel = self
+                            .tcp_channels
+                            .get_mut(&(from.clone(), *remote_counter))
+                            .unwrap();
+                        remote_channel.remote = Some(local.try_clone().unwrap());
+                        remote_channel.remote_addr =
+                            Some(SocketAddress::TcpStream(procid.name.clone(), counter));
+                        remote_channel
+                            .reverse(SocketAddress::TcpStream(from.clone(), *remote_counter))
+                    };
+                    self.tcp_channels
+                        .insert((procid.name.clone(), counter), channel);
+
+                    // send acknowledgment message
+                    let local_addr = SocketAddress::TcpStream(procid.name.clone(), counter);
+                    let raw = WireMessage {
+                        from: Some(local_addr.clone()),
+                        to: SocketAddress::TcpStream(from.clone(), *remote_counter),
+                        data: MessageData::TcpAck(procid.name.clone()),
+                    };
+                    let mut response_message = data::Message::new();
+                    response_message.from = procid.name.clone();
+                    response_message.to = from.clone();
+                    response_message.ty = "Tcp-Ack".to_string();
+                    response_message.raw = serde_json::to_value(&raw).unwrap();
+                    response.messages.push(response_message);
+                    self.address_to_name
+                        .insert(local_addr.clone(), from.clone());
+                    proc.accept_return(addr_ptr, addr_len, wire_message.from.clone(), local_addr)?;
+                } else {
+                    bail!("Unsupported address type");
+                }
+            }
+            _ => bail!("Bad message sent to accept()-ing socket"),
+        }
+        Ok(())
+    }
+
+    fn connect_handle_message(
+        &mut self,
+        procid: &TracedProcessIdentifier,
+        call: &Syscall,
+        wire_message: &WireMessage,
+    ) -> Result<(), Error> {
+        match &wire_message.data {
+            MessageData::TcpAck(_) => {
+                match call {
+                    Syscall::Connect(fd, _, _) => {
+                        match (wire_message.to.clone(), wire_message.from.clone()) {
+                            (
+                                SocketAddress::TcpStream(local_name, local_stream_id),
+                                Some(SocketAddress::TcpStream(remote_name, remote_stream_id)),
+                            ) => {
+                                let local_channel_id = (local_name, local_stream_id);
+                                let remote_channel_id = (remote_name, remote_stream_id);
+                                let listener = {
+                                    let local_channel =
+                                        self.tcp_channels.get(&local_channel_id).unwrap();
+                                    local_channel
+                                        .listener
+                                        .as_ref()
+                                        .unwrap()
+                                        .try_clone()
+                                        .unwrap()
+                                };
+                                let proc = self.procs.get_mut(&procid.clone()).expect("Bad procid");
+                                //let remote_stream = self.tcp_channels.get_mut(&(remote_name, remote_stream_id)).unwrap();
+                                // the connecting process should connect to our listener
+                                //local_stream.listener = remote_stream.listener.clone();
+                                let port = listener.local_addr().unwrap().port();
+                                // have the connecting process connect to the listener
+                                proc.connect_continue(SocketAddress::IPV4(port))?;
+                                // this accept() should return immediately
+                                trace!("Calling accept() on listener; port is {}", port);
+                                let stream: Rc<TcpStream> = listener.accept()?.0.into();
+                                // overwrite both local and remote streams
+                                // now that conn is established
+                                {
+                                    let local_channel =
+                                        self.tcp_channels.get_mut(&local_channel_id).unwrap();
+                                    local_channel.local = Some(stream.try_clone().unwrap());
+                                }
+                                {
+                                    let remote_channel =
+                                        self.tcp_channels.get_mut(&remote_channel_id).unwrap();
+                                    remote_channel.remote = Some(stream.try_clone().unwrap());
+                                }
+                                proc.connect_return(
+                                    *fd,
+                                    SocketAddress::TcpStream(procid.name.clone(), local_stream_id),
+                                )?;
+                            }
+                            _ => bail!("bad address pair for connect()"),
+                        }
+                    }
+                    _ => bail!("connect_handle_message with non-connect call"),
+                }
+            }
+            _ => bail!("Bad message sent to connect()-ing socket"),
+        }
+        Ok(())
+    }
+
+    fn recvfrom_handle_message(
+        &mut self,
+        procid: &TracedProcessIdentifier,
+        call: &Syscall,
+        wire_message: &WireMessage,
+    ) -> Result<(), Error> {
+        use File::*;
+        use MessageData::*;
+        match (call, &wire_message.data) {
+            (Syscall::RecvFrom(_, TcpSocket(_, _), _, _), TcpMessage(size)) => {
+                // do the actual tcp delivery
+                trace!("Got TCP message of size {}", size);
+                let channel: &mut TcpChannel = {
+                    match &wire_message.to {
+                        SocketAddress::TcpStream(name, id) => {
+                            self.tcp_channels.get_mut(&(name.to_string(), *id)).unwrap()
+                        }
+                        _ => bail!("unexpected address"),
+                    }
+                };
+                let mut buf = vec![0; *size];
+                trace!("Reading from socket");
+                channel.remote.as_ref().unwrap().read_exact(&mut buf)?;
+                trace!("Writing to socket");
+                channel.local.as_ref().unwrap().write_all(&buf)?;
+                {
+                    *channel.delivered.borrow_mut() += size;
+                }
+                let proc = self.procs.get_mut(&procid.clone()).expect("Bad procid");
+                proc.run_until_syscall()?;
+                let ret = proc.get_syscall_return(call.clone())?;
+                trace!("Process {} got syscall return {:?}", proc, ret);
+                if let SyscallReturn::Success(value) = ret {
+                    *channel.delivered.borrow_mut() -= value as usize;
+                }
+            }
+            (Syscall::RecvFrom(_, UDPSocket(_), _, _), Data(data)) => {
+                let proc = self.procs.get_mut(&procid.clone()).expect("Bad procid");
+                proc.recvfrom_return(wire_message.from.clone(), data.clone())?;
+            }
+            _ => bail!("Bad call + file for recvfrom"),
+        }
+        Ok(())
+    }
+
     fn handle_epoll(
         &mut self,
         procid: TracedProcessIdentifier,
@@ -1920,63 +2138,76 @@ impl Handlers {
                     }
                 }
             }
-            let proc = self
-                .procs
-                .get_mut(&procid)
-                .expect(&format!("Bad process identifier {:?}", procid));
-            {
+            let files = {
+                let proc = self.procs.get_mut(&procid.clone()).expect("Bad procid");
                 let all_files = proc.files.borrow();
-                let epoll_file = all_files.get(&epfd).unwrap();
+                let epoll_file = all_files.get(&epfd).unwrap().clone();
                 match epoll_file {
                     File::EpollFd(fds, _) => {
-                        let files: Vec<_> = fds
+                        let files: Vec<(i32, File, EpollFlags, u64)> = fds
                             .iter()
                             .map(|(fd, flags, data)| {
                                 (
-                                    fd,
+                                    *fd,
                                     all_files.get(&fd).unwrap().clone(),
                                     flags.clone(),
                                     data.clone(),
                                 )
                             })
                             .collect();
-                        for (fd, file, flags, data) in files.iter() {
-                            use File::*;
-                            match file {
-                                TcpSocket(Some(sockaddr)) => {
-                                    // our sockets are always EPOLLOUT-ready
-                                    waits.push(HandleEpollWait::Message(sockaddr.clone()));
-                                    if let HandleEpollReason::Message(ref addr) = reason {
-                                        if *sockaddr == addr.clone()
-                                            && flags.intersects(EpollFlags::EPOLLIN)
-                                        {
-                                            warn!("found this message's entry, recording it: {} {:?} {:?} {}",
-                                                  fd, file, flags, data);
-                                            return_entry = Some((**fd, *flags, *data));
-                                        }
-                                    }
-                                    if flags.intersects(EpollFlags::EPOLLOUT) {
-                                        // return this fd iff we're not returning something else
-                                        return_entry = return_entry.or(Some((**fd, *flags, *data)));
-                                    }
+                        files
+                    }
+                    _ => bail!("bad epoll"),
+                }
+            };
+            for (fd, file, flags, data) in files.iter() {
+                use File::*;
+                match file {
+                    TcpSocket(Some(sockaddr), _) => {
+                        waits.push(HandleEpollWait::Message(sockaddr.clone()));
+                        if let HandleEpollReason::Message(ref addr) = reason {
+                            if *sockaddr == addr.clone() && flags.intersects(EpollFlags::EPOLLIN) {
+                                warn!(
+                                    "found this message's entry, recording it: {} {:?} {:?} {}",
+                                    fd, file, flags, data
+                                );
+                                return_entry = Some((*fd, *flags, *data));
+                            }
+                        }
+                        // our sockets are always EPOLLOUT-ready
+                        else if flags.intersects(EpollFlags::EPOLLOUT) {
+                            // return this fd iff we're not returning something else
+                            return_entry = return_entry.or(Some((*fd, *flags, *data)));
+                        }
+                        // check to see if there messages available to read
+                        else if self.has_message(sockaddr)
+                            && flags.intersects(EpollFlags::EPOLLIN)
+                        {
+                            return_entry = return_entry.or(Some((*fd, *flags, *data)))
+                        }
+                        // check to see if this is a TCP channel and
+                        // there are undelivered bytes
+                        else if let SocketAddress::TcpStream(name, id) = sockaddr {
+                            if flags.intersects(EpollFlags::EPOLLIN) {
+                                let channel =
+                                    self.tcp_channels.get(&(name.to_string(), *id)).unwrap();
+                                if *channel.delivered.borrow() > 0 {
+                                    return_entry = return_entry.or(Some((*fd, *flags, *data)))
                                 }
-                                TimerFd(timeout_id) => {
-                                    waits.push(HandleEpollWait::Timeout(timeout_id.clone()));
-                                    if let HandleEpollReason::Timeout(ref id) = reason {
-                                        if *timeout_id == id.clone()
-                                            && flags.intersects(EpollFlags::EPOLLIN)
-                                        {
-                                            return_entry = Some((**fd, *flags, *data));
-                                        }
-                                    }
-                                }
-                                SignalFd => (),
-                                Special => (),
-                                f => bail!("Bad file {:?} in epoll", f),
                             }
                         }
                     }
-                    _ => bail!("bad epoll"),
+                    TimerFd(timeout_id) => {
+                        waits.push(HandleEpollWait::Timeout(timeout_id.clone()));
+                        if let HandleEpollReason::Timeout(ref id) = reason {
+                            if *timeout_id == id.clone() && flags.intersects(EpollFlags::EPOLLIN) {
+                                return_entry = Some((*fd, *flags, *data));
+                            }
+                        }
+                    }
+                    SignalFd => (),
+                    Special => (),
+                    f => bail!("Bad file {:?} in epoll", f),
                 }
             }
             // at this point, we have a complete list of waits and maybe a return value
@@ -1988,6 +2219,7 @@ impl Handlers {
                     // 3. stop waiting on all of these fds
                     // 4. clear the call's timeout, if there is one
                     {
+                        let proc = self.procs.get_mut(&procid.clone()).expect("Bad procid");
                         let mut all_files = proc.files.borrow_mut();
                         let epoll_file = all_files.get_mut(&epfd).unwrap();
                         match epoll_file {
@@ -2027,6 +2259,7 @@ impl Handlers {
                 None => {
                     // we're going to return, but we need to record that we are waiting
                     {
+                        let proc = self.procs.get_mut(&procid.clone()).expect("Bad procid");
                         let mut all_files = proc.files.borrow_mut();
                         let epoll_file = all_files.get_mut(&epfd).unwrap();
                         match epoll_file {
@@ -2143,24 +2376,27 @@ impl Handlers {
                 },
                 Syscall::RecvFrom(_, file, _, _) => match file {
                     File::UDPSocket(Some(_)) => (),
-                    File::TcpSocket(Some(SocketAddress::TcpStream(_, _))) => (),
+                    File::TcpSocket(Some(SocketAddress::TcpStream(_, _)), _) => (),
                     _ => bail!("Unsupported recvfrom on file {:?}", file),
                 },
                 Syscall::Accept(_, file) => match file {
-                    File::TcpSocket(Some(_)) => (),
+                    File::TcpSocket(Some(_), _) => (),
                     _ => bail!("Unsupported accept on file {:?}", file),
                 },
                 Syscall::SendTo(_, file, addr, _) => match (file, addr) {
                     (File::UDPSocket(_), Some(_)) => (),
-                    (File::TcpSocket(Some(SocketAddress::TcpStream(_, _))), _) => (),
+                    _ => bail!("Unsupported sendto on file {:?}", file),
+                },
+                Syscall::TcpSendTo(_, file, addr, _) => match (file, addr) {
+                    (File::TcpSocket(Some(SocketAddress::TcpStream(_, _)), _), _) => (),
                     _ => bail!("Unsupported sendto on file {:?}", file),
                 },
                 Syscall::SendMsg(_, file) => match file {
-                    File::TcpSocket(Some(SocketAddress::TcpStream(_, _))) => (),
+                    File::TcpSocket(Some(SocketAddress::TcpStream(_, _)), _) => (),
                     _ => bail!("Unsupported sendto on file {:?}", file),
                 },
                 Syscall::Connect(_, file, _) => match file {
-                    File::TcpSocket(_) => (),
+                    File::TcpSocket(_, _) => (),
                     _ => bail!("Unsupported connect on file {:?}", file),
                 },
                 Syscall::SetSockOpt(_, level, opt) => match (*level, *opt) {
@@ -2196,7 +2432,8 @@ impl Handlers {
                     // we need to write some data into this process's memory. fun!
                     proc.stop_syscall()?;
                     proc.wake_from_stopped_call_with_ret(*count as i32)?;
-                    let buf: Vec<u8> = vec![2; *count];
+                    let mut buf: Vec<u8> = vec![0; *count];
+                    proc.random.borrow_mut().fill_bytes(buf.as_mut_slice());
                     assert!(*count == buf.len());
                     proc.write_data(*buf_ptr, buf)?;
                     trace!("Faked a random read of len {}", *count);
@@ -2204,11 +2441,25 @@ impl Handlers {
                 }
                 Syscall::RecvFrom(_, File::UDPSocket(Some(addr)), _, _) => {
                     proc.stop_syscall()?;
-                    self.message_waiting_procs
-                        .insert(addr.clone(), (procid.clone(), call.clone()));
-                    // we're blocking, so we're done here
+                    match self.pop_message(addr) {
+                        Some(wire_message) => {
+                            trace!("Message already available, receiving it");
+                            self.recvfrom_handle_message(&procid, &call, &wire_message)?;
+                            stack.push(procid.clone());
+                        }
+                        None => {
+                            self.message_waiting_procs
+                                .insert(addr.clone(), (procid.clone(), call.clone()));
+                            // we're blocking, so we're done here
+                        }
+                    }
                 }
-                Syscall::RecvFrom(_, File::TcpSocket(Some(to_addr)), _size, flags) => {
+                Syscall::RecvFrom(
+                    _,
+                    File::TcpSocket(Some(to_addr), non_blocking),
+                    _size,
+                    flags,
+                ) => {
                     let to_addr = to_addr.clone();
                     let channel = {
                         match &to_addr {
@@ -2219,7 +2470,7 @@ impl Handlers {
                         }
                     };
                     let delivered = *channel.delivered.borrow();
-                    if delivered > 0 || flags.intersects(MsgFlags::MSG_DONTWAIT) {
+                    if delivered > 0 {
                         proc.run_until_syscall()?;
                         let ret = proc.get_syscall_return(call)?;
                         trace!("Process {} got syscall return {:?}", proc, ret);
@@ -2227,12 +2478,44 @@ impl Handlers {
                             *channel.delivered.borrow_mut() -= value as usize;
                         }
                         stack.push(procid.clone());
+                    } else if let Some(wire_message) = self.pop_message(&to_addr) {
+                        self.recvfrom_handle_message(&procid, &call, &wire_message)?;
+                        stack.push(procid.clone());
+                    } else if flags.intersects(MsgFlags::MSG_DONTWAIT) {
+                        let proc = self
+                            .procs
+                            .get_mut(&procid)
+                            .expect(&format!("Bad process identifier {:?}", procid));
+                        proc.run_until_syscall()?;
+                        let ret = proc.get_syscall_return(call)?;
+                        trace!("Process {} got syscall return {:?}", proc, ret);
+                        let channel = {
+                            match &to_addr {
+                                SocketAddress::TcpStream(name, id) => {
+                                    self.tcp_channels.get(&(name.to_string(), *id)).unwrap()
+                                }
+                                _ => bail!("unexpected address"),
+                            }
+                        };
+                        if let SyscallReturn::Success(value) = ret {
+                            *channel.delivered.borrow_mut() -= value as usize;
+                        }
+                        stack.push(procid.clone());
+                    } else if *non_blocking {
+                        let proc = self
+                            .procs
+                            .get_mut(&procid)
+                            .expect(&format!("Bad process identifier {:?}", procid));
+                        trace!("non-blocking receive would block, so returning error");
+                        proc.stop_syscall()?;
+                        proc.wake_from_stopped_call_with_ret(-1 * libc::EWOULDBLOCK)?;
+                        stack.push(procid.clone());
                     } else {
                         self.message_waiting_procs
                             .insert(to_addr.clone(), (procid.clone(), call.clone()));
                     }
                 }
-                Syscall::Connect(_fd, File::TcpSocket(from_addr), to_addr) => {
+                Syscall::Connect(_fd, File::TcpSocket(from_addr, _), to_addr) => {
                     // don't stop the process
                     if let Some(to) = self.address_to_name.get(&to_addr) {
                         let counter = proc.next_counter();
@@ -2244,7 +2527,7 @@ impl Handlers {
                         let raw = WireMessage {
                             from: from_addr.clone(),
                             to: to_addr.clone(),
-                            data: MessageData::TcpConnect(counter),
+                            data: MessageData::TcpConnect(procid.name.clone(), counter),
                         };
                         let mut message = data::Message::new();
                         message.from = procid.name.clone();
@@ -2262,10 +2545,23 @@ impl Handlers {
                         bail!("Connect to unknown address {:?}", to_addr);
                     }
                 }
-                Syscall::Accept(_, File::TcpSocket(Some(addr))) => {
-                    // don't stop the process
-                    self.message_waiting_procs
-                        .insert(addr.clone(), (procid.clone(), call.clone()));
+                Syscall::Accept(_, File::TcpSocket(Some(addr), non_blocking)) => {
+                    if let Some(wire_message) = self.pop_message(&addr) {
+                        self.accept_handle_message(&procid, &call, &wire_message, response)?;
+                        stack.push(procid.clone());
+                    } else if *non_blocking {
+                        let proc = self
+                            .procs
+                            .get_mut(&procid)
+                            .expect(&format!("Bad process identifier {:?}", procid));
+                        trace!("non-blocking accept would block, so returning error");
+                        proc.stop_syscall()?;
+                        proc.wake_from_stopped_call_with_ret(-1 * libc::EWOULDBLOCK)?;
+                        stack.push(procid.clone());
+                    } else {
+                        self.message_waiting_procs
+                            .insert(addr.clone(), (procid.clone(), call.clone()));
+                    }
                 }
                 Syscall::NanoSleep(timeout_id, clock) => {
                     proc.stop_syscall()?;
@@ -2333,9 +2629,9 @@ impl Handlers {
                     }
                 }
                 // handle TCP send
-                Syscall::SendTo(_, File::TcpSocket(Some(to_addr)), _, data) => {
+                Syscall::TcpSendTo(_, File::TcpSocket(Some(to_addr), _), _, data_len) => {
                     let to_addr = to_addr.clone();
-                    let data_len = data.len();
+                    let data_len = *data_len;
                     proc.run_until_syscall()?;
                     let ret = proc.get_syscall_return(call)?;
                     trace!("Process {} got syscall return {:?}", proc, ret);
@@ -2361,7 +2657,7 @@ impl Handlers {
                     };
                     stack.push(procid.clone());
                 }
-                Syscall::SendMsg(_, File::TcpSocket(Some(to_addr))) => {
+                Syscall::SendMsg(_, File::TcpSocket(Some(to_addr), _)) => {
                     let to_addr = to_addr.clone();
                     proc.run_until_syscall()?;
                     let ret = proc.get_syscall_return(call)?;
@@ -2699,10 +2995,18 @@ impl Handlers {
                     }
                 }
                 // we want to block attempts to make things non-blocking
-                Syscall::Fcntl(_, file, FcntlCmd::SetFl(flags))
-                    if !file.is_special() && flags.intersects(OFlag::O_NONBLOCK) =>
-                {
-                    trace!("Stopping attempt to make something non-blocking");
+                Syscall::Fcntl(fd, file, FcntlCmd::SetFl(flags)) if !file.is_special() => {
+                    match file {
+                        File::TcpSocket(addr, _) => {
+                            // Make TCP socket blocking or non-blocking
+                            let blocking = flags.intersects(OFlag::O_NONBLOCK);
+                            trace!("Setting blocking={} for TCP socket {:?}", blocking, file);
+                            let mut all_files = proc.files.borrow_mut();
+                            all_files.insert(*fd, File::TcpSocket(addr.clone(), blocking));
+                        }
+                        _ => (),
+                    }
+                    trace!("Stopping attempt to make file non-blocking in OS");
                     proc.stop_syscall()?;
                     proc.wake_from_stopped_call(call)?;
                     stack.push(procid.clone());
@@ -2912,226 +3216,53 @@ impl Handlers {
         let node = message.to;
         let raw = message.raw;
         let wire_message: WireMessage = serde_json::from_value(raw)?;
-        // first, deliver a TCP message if necessary
-        if let MessageData::TcpMessage(size) = &wire_message.data {
-            trace!("Got TCP message of size {}", size);
-            let channel: &mut TcpChannel = {
-                match &wire_message.to {
-                    SocketAddress::TcpStream(name, id) => {
-                        self.tcp_channels.get_mut(&(name.to_string(), *id)).unwrap()
-                    }
-                    _ => bail!("unexpected address"),
-                }
-            };
-            let mut buf = vec![0; *size];
-            trace!("Reading from socket");
-            channel.remote.as_ref().unwrap().read_exact(&mut buf)?;
-            trace!("Writing to socket");
-            channel.local.as_ref().unwrap().write_all(&buf)?;
-            *channel.delivered.borrow_mut() += size;
-        }
-        let mut message_delivered = false;
-        while !message_delivered {
-            let wire_message = wire_message.clone();
-            if let Some((procid, call)) = self.message_waiting_procs.remove(&wire_message.to) {
-                let procid = procid.clone();
-                let call = call.clone();
-                if procid.name != node {
-                    bail!(
-                        "Message send to mismatched node ({} vs {})",
-                        procid.name,
-                        node
-                    );
-                }
-                match call {
-                    Syscall::EpollWait(_, _, _, _) => {
-                        let ret = self.handle_epoll(
-                            procid.clone(),
-                            call.clone(),
-                            HandleEpollReason::Message(wire_message.to.clone()),
-                            response,
-                        )?;
-                        if let HandleEpollResult::Return(events_ptr, data, why) = ret {
-                            let proc = self.procs.get_mut(&procid.clone()).expect("Bad procid");
-                            proc.epoll_return(events_ptr, data, why)?;
-                        } else {
-                            bail!("delivered epoll message, failed to wake");
-                        }
-                        if let MessageData::TcpMessage(_) = &wire_message.data {
-                            // we've delivered this message and alerted the receiver,
-                            // so we're done
-                            message_delivered = true;
-                        }
-                    }
-                    _ => {
-                        let proc = self.procs.get_mut(&procid.clone()).expect("Bad procid");
-                        match wire_message.data {
-                            MessageData::Data(data) => {
-                                message_delivered = true;
-                                proc.recvfrom_return(wire_message.from, data)?;
-                            }
-                            MessageData::TcpConnect(remote_counter) => {
-                                message_delivered = true;
-                                if let Syscall::Accept(_, _) = call {
-                                    if let SocketAddress::IPV4(port) = wire_message.to {
-                                        // start accepting, but don't wait for syscall to return
-                                        let (addr_ptr, addr_len) = proc.accept_continue()?;
-                                        // this call should return immediately, since proc is accepting
-                                        let local =
-                                            TcpStream::connect(("localhost", port)).unwrap();
-                                        let counter = proc.next_counter();
-                                        let channel = {
-                                            let remote_channel = self
-                                                .tcp_channels
-                                                .get_mut(&(message.from.clone(), remote_counter))
-                                                .unwrap();
-                                            remote_channel.remote =
-                                                Some(local.try_clone().unwrap());
-                                            remote_channel.remote_addr =
-                                                Some(SocketAddress::TcpStream(
-                                                    procid.name.clone(),
-                                                    counter,
-                                                ));
-                                            remote_channel.reverse(SocketAddress::TcpStream(
-                                                message.from.clone(),
-                                                remote_counter,
-                                            ))
-                                        };
-                                        self.tcp_channels
-                                            .insert((procid.name.clone(), counter), channel);
-
-                                        // send acknowledgment message
-                                        let local_addr =
-                                            SocketAddress::TcpStream(procid.name.clone(), counter);
-                                        let raw = WireMessage {
-                                            from: Some(local_addr.clone()),
-                                            to: SocketAddress::TcpStream(
-                                                message.from.clone(),
-                                                remote_counter,
-                                            ),
-                                            data: MessageData::TcpAck(procid.name.clone()),
-                                        };
-                                        let mut response_message = data::Message::new();
-                                        response_message.from = procid.name.clone();
-                                        response_message.to = message.from.clone();
-                                        response_message.ty = "Tcp-Ack".to_string();
-                                        response_message.raw = serde_json::to_value(&raw).unwrap();
-                                        response.messages.push(response_message);
-                                        self.address_to_name
-                                            .insert(local_addr.clone(), message.from.clone());
-                                        proc.accept_return(
-                                            addr_ptr,
-                                            addr_len,
-                                            wire_message.from,
-                                            local_addr,
-                                        )?;
-                                    } else {
-                                        bail!("Unsupported address type");
-                                    }
-                                } else {
-                                    bail!("Connect to socket that isn't accept()-ing");
-                                }
-                            }
-                            MessageData::TcpAck(_remote_name) => {
-                                message_delivered = true;
-                                if let Syscall::Connect(fd, _, _) = call {
-                                    match (wire_message.to, wire_message.from) {
-                                        (
-                                            SocketAddress::TcpStream(local_name, local_stream_id),
-                                            Some(SocketAddress::TcpStream(
-                                                remote_name,
-                                                remote_stream_id,
-                                            )),
-                                        ) => {
-                                            let local_channel_id = (local_name, local_stream_id);
-                                            let remote_channel_id = (remote_name, remote_stream_id);
-                                            let listener = {
-                                                let local_channel = self
-                                                    .tcp_channels
-                                                    .get(&local_channel_id)
-                                                    .unwrap();
-                                                local_channel
-                                                    .listener
-                                                    .as_ref()
-                                                    .unwrap()
-                                                    .try_clone()
-                                                    .unwrap()
-                                            };
-                                            //let remote_stream = self.tcp_channels.get_mut(&(remote_name, remote_stream_id)).unwrap();
-                                            // the connecting process should connect to our listener
-                                            //local_stream.listener = remote_stream.listener.clone();
-                                            let port = listener.local_addr().unwrap().port();
-                                            // have the connecting process connect to the listener
-                                            proc.connect_continue(SocketAddress::IPV4(port))?;
-                                            // this accept() should return immediately
-                                            trace!(
-                                                "Calling accept() on listener; port is {}",
-                                                port
-                                            );
-                                            let stream: Rc<TcpStream> = listener.accept()?.0.into();
-                                            // overwrite both local and remote streams
-                                            // now that conn is established
-                                            {
-                                                let local_channel = self
-                                                    .tcp_channels
-                                                    .get_mut(&local_channel_id)
-                                                    .unwrap();
-                                                local_channel.local =
-                                                    Some(stream.try_clone().unwrap());
-                                            }
-                                            {
-                                                let remote_channel = self
-                                                    .tcp_channels
-                                                    .get_mut(&remote_channel_id)
-                                                    .unwrap();
-                                                remote_channel.remote =
-                                                    Some(stream.try_clone().unwrap());
-                                            }
-                                            proc.connect_return(
-                                                fd,
-                                                SocketAddress::TcpStream(
-                                                    procid.name.clone(),
-                                                    local_stream_id,
-                                                ),
-                                            )?;
-                                        }
-                                        _ => bail!("Bad Tcp-Ack message"),
-                                    }
-                                } else {
-                                    bail!("Ack to socket that isn't connect()-ing");
-                                }
-                            }
-                            MessageData::TcpMessage(_len) => {
-                                message_delivered = true;
-                                // we've got a TCP message and a waiting receiver. We
-                                // already delivered the message.
-                                let to_addr = wire_message.to.clone();
-                                let channel = {
-                                    match &to_addr {
-                                        SocketAddress::TcpStream(name, id) => {
-                                            self.tcp_channels.get(&(name.to_string(), *id)).unwrap()
-                                        }
-                                        _ => bail!("unexpected address"),
-                                    }
-                                };
-                                proc.run_until_syscall()?;
-                                let ret = proc.get_syscall_return(call.clone())?;
-                                trace!("Process {} got syscall return {:?}", proc, ret);
-                                if let SyscallReturn::Success(value) = ret {
-                                    *channel.delivered.borrow_mut() -= value as usize;
-                                }
-                            }
-                        }
-                    }
-                }
-                let procid = procid.clone();
-                self.fill_response(procid.clone(), response)?;
-                self.send_tcp_message(response)?;
-                self.get_state(procid.clone().parent_process(), response)?;
-            } else {
-                warn!("Message without matching waiting process");
-                message_delivered = true;
+        let to_addr = wire_message.to.clone();
+        self.push_message(to_addr.clone(), wire_message);
+        if let Some((procid, call)) = self.message_waiting_procs.remove(&to_addr) {
+            let procid = procid.clone();
+            let call = call.clone();
+            if procid.name != node {
+                bail!(
+                    "Message send to mismatched node ({} vs {})",
+                    procid.name,
+                    node
+                );
             }
+            match &call {
+                Syscall::EpollWait(_, _, _, _) => {
+                    let ret = self.handle_epoll(
+                        procid.clone(),
+                        call.clone(),
+                        HandleEpollReason::Message(to_addr.clone()),
+                        response,
+                    )?;
+                    if let HandleEpollResult::Return(events_ptr, data, why) = ret {
+                        let proc = self.procs.get_mut(&procid.clone()).expect("Bad procid");
+                        proc.epoll_return(events_ptr, data, why)?;
+                    } else {
+                        bail!("delivered epoll message, failed to wake");
+                    }
+                }
+                Syscall::RecvFrom(_, _, _, _) => {
+                    let wire_message = self.pop_message(&to_addr).unwrap();
+                    self.recvfrom_handle_message(&procid, &call, &wire_message)?;
+                }
+                Syscall::Accept(_, _) => {
+                    let wire_message = self.pop_message(&to_addr).unwrap();
+                    self.accept_handle_message(&procid, &call, &wire_message, response)?;
+                }
+                Syscall::Connect(_, _, _) => {
+                    let wire_message = self.pop_message(&to_addr).unwrap();
+                    self.connect_handle_message(&procid, &call, &wire_message)?;
+                }
+                _ => bail!("Bad message_waiing call {:?}", call),
+            }
+            let procid = procid.clone();
+            self.fill_response(procid.clone(), response)?;
+            self.send_tcp_message(response)?;
+            self.get_state(procid.clone().parent_process(), response)?;
+        } else {
+            warn!("Message without matching waiting process");
         }
         Ok(())
     }
@@ -3225,7 +3356,6 @@ impl Handlers {
 #[cfg(target_os = "linux")]
 impl Drop for Handlers {
     fn drop(&mut self) {
-        self.kill_all_processes()
-            .expect("Problem killing procs while dropping Handlers");
+        let _ = self.kill_all_processes();
     }
 }
