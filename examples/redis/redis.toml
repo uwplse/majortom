@@ -1,0 +1,9 @@
+[oddity]
+address="10.0.2.2:4343"
+
+[nodes]
+node1="./redis-src/src/redis-server redis1.conf"
+node2="./redis-src/src/redis-server redis2.conf"
+node3="./redis-src/src/redis-server redis3.conf"
+node4="./redis-src/src/redis-server redis4.conf"
+client="./redis-src/src/redis-cli --cluster create 127.0.0.1:7001 127.0.0.1:7002 127.0.0.1:7003 127.0.0.1:7004"

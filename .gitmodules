@@ -1,3 +1,6 @@
 [submodule "examples/logcabin/logcabin-src"]
 	path = examples/logcabin/logcabin-src
 	url = git@github.com:dwoos/logcabin.git
+[submodule "examples/redis/redis-src"]
+	path = examples/redis/redis-src
+	url = git@github.com:dwoos/redis.git
