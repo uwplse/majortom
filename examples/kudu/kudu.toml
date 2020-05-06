@@ -1,0 +1,5 @@
+[oddity]
+address="10.0.2.2:4343"
+
+[nodes]
+master="./kudu-src/build/debug/kudu-master --fs_wal_dir /tmp/master_dir"
