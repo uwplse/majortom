@@ -6,7 +6,7 @@ mod common;
 #[test]
 fn test_threaded() {
     let config = common::setup_example("threaded");
-    let mut handlers = ptrace_handlers::Handlers::new(config.nodes);
+    let mut handlers = ptrace_handlers::Handlers::new(config);
     let mut response = data::Response::new();
     handlers
         .handle_start("pinger".to_string(), &mut response)
