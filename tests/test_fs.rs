@@ -70,7 +70,7 @@ fn test_directory() {
     let config = setup_example("fs");
     // ensure writefile doesn't exist before we start
     let _ = std::fs::remove_file("directory");
-    let mut handlers = ptrace_handlers::Handlers::new(config.nodes);
+    let mut handlers = ptrace_handlers::Handlers::new(&config);
     for _ in 0..2 {
         let mut response = data::Response::new();
         handlers
